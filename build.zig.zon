@@ -1,0 +1,13 @@
+.{
+    .name = .lightboard,
+    .version = "0.0.0",
+    .fingerprint = 0xb42183dae10e6ac1,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+}
