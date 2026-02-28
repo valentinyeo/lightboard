@@ -290,5 +290,7 @@ pub extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(WINAPI) BOOL;
 pub extern "dwmapi" fn DwmSetWindowAttribute(hwnd: HWND, dwAttribute: DWORD, pvAttribute: *const anyopaque, cbAttribute: DWORD) callconv(WINAPI) i32;
 
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWORD = 20;
+pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWORD = 33;
 pub const DWMWA_CAPTION_COLOR: DWORD = 35;
 pub const DWMWA_TEXT_COLOR: DWORD = 36;
+pub const DWMWCP_ROUND: DWORD = 2;

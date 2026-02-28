@@ -11,9 +11,9 @@ const HOTKEY_ID_F8: usize = 2;
 const TARGET_TRACK_TIMER_ID: usize = 1;
 const TARGET_TRACK_INTERVAL_MS: w.UINT = 20;
 const MAX_VISIBLE_ROWS: usize = 4;
-const LIST_TOP: c_int = 12;
-const CARD_HEIGHT: c_int = 104;
-const ROW_STEP: c_int = 112;
+const LIST_TOP: c_int = 8;
+const CARD_HEIGHT: c_int = 80;
+const ROW_STEP: c_int = 84;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 var g_history = history.History.init(120);
@@ -96,8 +96,8 @@ pub fn main() !void {
         w.WS_OVERLAPPEDWINDOW,
         w.CW_USEDEFAULT,
         w.CW_USEDEFAULT,
-        340,
-        460,
+        368,
+        480,
         null,
         null,
         hinstance,
@@ -108,7 +108,7 @@ pub fn main() !void {
     applyWindowTheme(g_picker_hwnd);
 
     g_ui_font = w.CreateFontW(
-        -13,
+        -14,
         0,
         0,
         0,
@@ -121,7 +121,7 @@ pub fn main() !void {
         0,
         0,
         0,
-        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI"),
+        std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Variable"),
     );
     defer {
         if (g_ui_font != null) {
@@ -426,13 +426,12 @@ fn paintPicker(hwnd: w.HWND) void {
     defer _ = w.EndPaint(hwnd, &ps);
     if (g_ui_font != null) _ = w.SelectObject(hdc, g_ui_font);
 
-    const color_bg = w.RGB(24, 24, 29);
-    const color_card = w.RGB(40, 41, 48);
-    const color_card_selected = w.RGB(57, 70, 98);
-    const color_badge_txt = w.RGB(126, 153, 255);
-    const color_badge_img = w.RGB(106, 210, 164);
-    const color_text_main = w.RGB(236, 238, 244);
-    const color_text_sub = w.RGB(158, 162, 178);
+    const color_bg = w.RGB(32, 32, 32);
+    const color_card = w.RGB(44, 44, 44);
+    const color_card_selected = w.RGB(48, 48, 48);
+    const color_accent = w.RGB(96, 205, 255);
+    const color_text_main = w.RGB(255, 255, 255);
+    const color_text_sub = w.RGB(157, 157, 157);
 
     var rect: w.RECT = .{};
     _ = w.GetClientRect(hwnd, &rect);
@@ -445,17 +444,10 @@ fn paintPicker(hwnd: w.HWND) void {
     _ = w.SetBkMode(hdc, w.TRANSPARENT);
     _ = w.SetTextColor(hdc, color_text_main);
 
-    const panel_rect = w.RECT{ .left = 6, .top = 6, .right = rect.right - 6, .bottom = rect.bottom - 6 };
-    const panel_brush = w.CreateSolidBrush(w.RGB(19, 20, 25));
-    if (panel_brush != null) {
-        _ = w.FillRect(hdc, &panel_rect, panel_brush);
-        _ = w.DeleteObject(panel_brush);
-    }
-
     const len = g_history.len();
     if (len == 0) {
         _ = w.SetTextColor(hdc, color_text_sub);
-        drawUtf8Line(hdc, 22, 24, "Clipboard history is empty");
+        drawUtf8Line(hdc, 16, 20, "Clipboard history is empty");
         return;
     }
 
@@ -472,26 +464,35 @@ fn paintPicker(hwnd: w.HWND) void {
         const entry_idx = (len - 1) - from_newest;
         const is_selected = from_newest == selected;
 
-        const row_rect = w.RECT{ .left = 14, .top = y, .right = rect.right - 14, .bottom = y + CARD_HEIGHT };
+        const row_rect = w.RECT{ .left = 12, .top = y, .right = rect.right - 20, .bottom = y + CARD_HEIGHT };
         const row_brush = w.CreateSolidBrush(if (is_selected) color_card_selected else color_card);
         if (row_brush != null) {
             _ = w.FillRect(hdc, &row_rect, row_brush);
             _ = w.DeleteObject(row_brush);
         }
 
-        renderEntryLine(hdc, row_rect, g_history.entries.items[entry_idx], color_badge_txt, color_badge_img, color_text_main, color_text_sub);
+        if (is_selected) {
+            const bar_h: c_int = 20;
+            const bar_top = y + @divTrunc(CARD_HEIGHT - bar_h, 2);
+            const accent_rect = w.RECT{ .left = 12, .top = bar_top, .right = 15, .bottom = bar_top + bar_h };
+            const accent_brush = w.CreateSolidBrush(color_accent);
+            if (accent_brush != null) {
+                _ = w.FillRect(hdc, &accent_rect, accent_brush);
+                _ = w.DeleteObject(accent_brush);
+            }
+        }
+
+        renderEntryLine(hdc, row_rect, g_history.entries.items[entry_idx], color_text_main, color_text_sub);
         y += ROW_STEP;
     }
 
     drawScrollbar(hdc, rect, len, start_from_newest, visible_rows);
 }
 
-fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_badge_txt: w.COLORREF, color_badge_img: w.COLORREF, color_text_main: w.COLORREF, color_text_sub: w.COLORREF) void {
-    _ = color_badge_txt;
-    _ = color_badge_img;
+fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_main: w.COLORREF, color_text_sub: w.COLORREF) void {
     _ = color_text_sub;
-    const text_x = rect.left + 12;
-    const text_y = rect.top + 12;
+    const text_x = rect.left + 14;
+    const text_y = rect.top + 10;
 
     switch (entry.item) {
         .text => |text| {
@@ -501,15 +502,15 @@ fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_badge_t
             var li: usize = 0;
             while (li < lens.len) : (li += 1) {
                 if (lens[li] == 0) break;
-                drawUtf8Line(hdc, text_x, text_y + @as(c_int, @intCast(li * 24)), lines[li][0..lens[li]]);
+                drawUtf8Line(hdc, text_x, text_y + @as(c_int, @intCast(li * 20)), lines[li][0..lens[li]]);
             }
         },
         .image => |img| {
             const thumb_rect = w.RECT{
                 .left = rect.left + 12,
-                .top = rect.top + 12,
+                .top = rect.top + 8,
                 .right = rect.right - 12,
-                .bottom = rect.top + 88,
+                .bottom = rect.top + 72,
             };
             drawImageThumbnail(hdc, thumb_rect, img);
         },
@@ -761,19 +762,12 @@ fn ensureSelectionVisible() void {
 fn drawScrollbar(hdc: w.HDC, rect: w.RECT, total: usize, start: usize, visible_rows: usize) void {
     if (total <= visible_rows) return;
 
-    const track = w.RECT{
-        .left = rect.right - 8,
-        .top = 12,
-        .right = rect.right - 4,
-        .bottom = rect.bottom - 12,
-    };
-    const track_brush = w.CreateSolidBrush(w.RGB(52, 54, 62));
-    if (track_brush != null) {
-        _ = w.FillRect(hdc, &track, track_brush);
-        _ = w.DeleteObject(track_brush);
-    }
+    const track_left = rect.right - 6;
+    const track_right = rect.right - 4;
+    const track_top: c_int = 8;
+    const track_bottom: c_int = rect.bottom - 8;
+    const track_h = track_bottom - track_top;
 
-    const track_h = track.bottom - track.top;
     var thumb_h: i32 = @intCast(@divTrunc((@as(i64, track_h) * @as(i64, @intCast(visible_rows))), @as(i64, @intCast(total))));
     if (thumb_h < 24) thumb_h = 24;
     const max_start = total - visible_rows;
@@ -781,12 +775,12 @@ fn drawScrollbar(hdc: w.HDC, rect: w.RECT, total: usize, start: usize, visible_r
     const thumb_off: i32 = if (max_start == 0) 0 else @intCast(@divTrunc((@as(i64, travel) * @as(i64, @intCast(start))), @as(i64, @intCast(max_start))));
 
     const thumb = w.RECT{
-        .left = track.left,
-        .top = track.top + thumb_off,
-        .right = track.right,
-        .bottom = track.top + thumb_off + thumb_h,
+        .left = track_left,
+        .top = track_top + thumb_off,
+        .right = track_right,
+        .bottom = track_top + thumb_off + thumb_h,
     };
-    const thumb_brush = w.CreateSolidBrush(w.RGB(134, 138, 152));
+    const thumb_brush = w.CreateSolidBrush(w.RGB(153, 153, 153));
     if (thumb_brush != null) {
         _ = w.FillRect(hdc, &thumb, thumb_brush);
         _ = w.DeleteObject(thumb_brush);
@@ -826,10 +820,13 @@ fn applyWindowTheme(hwnd: w.HWND) void {
     var dark: w.BOOL = 1;
     _ = w.DwmSetWindowAttribute(hwnd, w.DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, @sizeOf(w.BOOL));
 
-    var caption: w.DWORD = w.RGB(30, 30, 34);
+    var corner: w.DWORD = w.DWMWCP_ROUND;
+    _ = w.DwmSetWindowAttribute(hwnd, w.DWMWA_WINDOW_CORNER_PREFERENCE, &corner, @sizeOf(w.DWORD));
+
+    var caption: w.DWORD = w.RGB(32, 32, 32);
     _ = w.DwmSetWindowAttribute(hwnd, w.DWMWA_CAPTION_COLOR, &caption, @sizeOf(w.DWORD));
 
-    var text: w.DWORD = w.RGB(238, 238, 242);
+    var text: w.DWORD = w.RGB(255, 255, 255);
     _ = w.DwmSetWindowAttribute(hwnd, w.DWMWA_TEXT_COLOR, &text, @sizeOf(w.DWORD));
 }
 
