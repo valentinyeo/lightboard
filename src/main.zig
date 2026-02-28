@@ -599,13 +599,32 @@ fn drawImageThumbnail(hdc: w.HDC, rect: w.RECT, image: history.ImageMeta) void {
 
     const src_w: c_int = @intCast(@abs(header.biWidth));
     const src_h: c_int = @intCast(@abs(header.biHeight));
-    const dst_w: c_int = rect.right - rect.left;
-    const dst_h: c_int = rect.bottom - rect.top;
+    const box_w: c_int = rect.right - rect.left;
+    const box_h: c_int = rect.bottom - rect.top;
 
-    const _res = w.StretchDIBits(
+    // Fit image proportionally inside the destination box, centered
+    const dst_w: c_int, const dst_h: c_int = blk: {
+        if (src_w == 0 or src_h == 0) break :blk .{ box_w, box_h };
+        const scale_w = @as(i64, box_w) * @as(i64, src_h);
+        const scale_h = @as(i64, box_h) * @as(i64, src_w);
+        if (scale_w <= scale_h) {
+            // Width-limited
+            const h: c_int = @intCast(@divTrunc((@as(i64, box_w) * @as(i64, src_h)), @as(i64, src_w)));
+            break :blk .{ box_w, h };
+        } else {
+            // Height-limited
+            const w_fit: c_int = @intCast(@divTrunc((@as(i64, box_h) * @as(i64, src_w)), @as(i64, src_h)));
+            break :blk .{ w_fit, box_h };
+        }
+    };
+
+    const x_off = rect.left + @divTrunc(box_w - dst_w, 2);
+    const y_off = rect.top + @divTrunc(box_h - dst_h, 2);
+
+    _ = w.StretchDIBits(
         hdc,
-        rect.left,
-        rect.top,
+        x_off,
+        y_off,
         dst_w,
         dst_h,
         0,
@@ -617,7 +636,6 @@ fn drawImageThumbnail(hdc: w.HDC, rect: w.RECT, image: history.ImageMeta) void {
         w.DIB_RGB_COLORS,
         w.SRCCOPY,
     );
-    _ = _res;
 }
 
 fn drawUtf8Line(hdc: w.HDC, x: c_int, y: c_int, text: []const u8) void {
