@@ -28,6 +28,10 @@ After every code change, always do all of the following in order:
 
 Never wait for the user to ask — do this automatically after every change.
 
+## MANDATORY: Keep CLAUDE.md Updated
+
+When making significant changes (new features, new files, architecture changes, new hotkeys, new dependencies), update this file to reflect them. Keep the Architecture and Key Patterns sections accurate so future sessions start productive immediately.
+
 ## Architecture
 
 Lightboard is a Windows clipboard history manager written in pure Zig with no external dependencies. It uses raw Win32 API calls (no Zig std GUI abstractions).
