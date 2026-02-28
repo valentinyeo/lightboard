@@ -4,27 +4,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run
 
+Zig is installed via winget. It is NOT on PATH in Git Bash. Always use the full path:
+
 ```bash
-zig build                          # debug build
-zig build -Doptimize=ReleaseSmall  # release build (smaller binary)
-zig build run                      # build and run
+export ZIG="/c/Users/valen/AppData/Local/Microsoft/WinGet/Packages/zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe/zig-x86_64-windows-0.15.2/zig.exe"
+"$ZIG" build                          # debug build
+"$ZIG" build -Doptimize=ReleaseSmall  # release build (smaller binary)
+```
+
+The exe gets locked while running. Always kill before building:
+```bash
+taskkill.exe //f //im lightboard.exe 2>/dev/null; "$ZIG" build
 ```
 
 Requires Zig 0.15.2+. Links libc. Targets Windows only (subsystem = .Windows).
 
 Output binary: `zig-out/bin/lightboard.exe`
 
-No tests, linter, or formatter configured yet. Use `zig fmt src/` if needed.
+No tests, linter, or formatter configured yet. Use `"$ZIG" fmt src/` if needed.
 
 ## MANDATORY: After Every Code Change
 
 After every code change, always do all of the following in order:
 1. Commit and push to GitHub immediately
-2. Build: `zig build`
-3. Kill any running lightboard process: `taskkill /f /im lightboard.exe`
-4. Launch the new binary: `start zig-out/bin/lightboard.exe`
-5. Verify it's running: `tasklist | findstr lightboard`
-6. Tell the user it's ready to test
+2. Kill + rebuild: `taskkill.exe //f //im lightboard.exe 2>/dev/null; "$ZIG" build`
+3. Launch the new binary: `./zig-out/bin/lightboard.exe &`
+4. Verify it's running: `tasklist.exe | grep -i lightboard`
+5. Tell the user it's ready to test
 
 Never wait for the user to ask — do this automatically after every change.
 
