@@ -68,6 +68,7 @@ pub fn main() !void {
     const picker_class = w.WNDCLASSEXW{
         .lpfnWndProc = wndProc,
         .hInstance = hinstance,
+        .hCursor = w.LoadCursorW(null, w.IDC_ARROW),
         .lpszClassName = PICKER_CLASS,
     };
     if (w.RegisterClassExW(&picker_class) == 0) {
@@ -367,11 +368,9 @@ fn handlePickerKey(key: w.UINT) void {
 }
 
 fn handlePickerChar(ch: w.UINT) void {
-    switch (ch) {
-        'j', 'J' => moveSelection(1),
-        'k', 'K' => moveSelection(-1),
-        else => {},
-    }
+    // WM_CHAR is consumed here to prevent Windows beeping on unhandled chars.
+    // j/k navigation is handled in handlePickerKey via WM_KEYDOWN.
+    _ = ch;
 }
 
 fn moveSelection(delta: i32) void {

@@ -201,6 +201,9 @@ pub extern "kernel32" fn GlobalSize(hMem: HGLOBAL) callconv(WINAPI) SIZE_T;
 pub extern "kernel32" fn GlobalAlloc(uFlags: UINT, dwBytes: SIZE_T) callconv(WINAPI) HGLOBAL;
 pub extern "kernel32" fn GetLastError() callconv(WINAPI) DWORD;
 
+pub extern "user32" fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: usize) callconv(WINAPI) ?*anyopaque;
+pub const IDC_ARROW: usize = 32512;
+
 pub extern "user32" fn RegisterClassExW(lpwcx: *const WNDCLASSEXW) callconv(WINAPI) ATOM;
 pub extern "user32" fn CreateWindowExW(
     dwExStyle: DWORD,
