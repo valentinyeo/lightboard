@@ -16,6 +16,18 @@ Output binary: `zig-out/bin/lightboard.exe`
 
 No tests, linter, or formatter configured yet. Use `zig fmt src/` if needed.
 
+## MANDATORY: After Every Code Change
+
+After every code change, always do all of the following in order:
+1. Commit and push to GitHub immediately
+2. Build: `zig build`
+3. Kill any running lightboard process: `taskkill /f /im lightboard.exe`
+4. Launch the new binary: `start zig-out/bin/lightboard.exe`
+5. Verify it's running: `tasklist | findstr lightboard`
+6. Tell the user it's ready to test
+
+Never wait for the user to ask — do this automatically after every change.
+
 ## Architecture
 
 Lightboard is a Windows clipboard history manager written in pure Zig with no external dependencies. It uses raw Win32 API calls (no Zig std GUI abstractions).
