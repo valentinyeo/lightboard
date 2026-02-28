@@ -10,10 +10,14 @@ const HOTKEY_ID: usize = 1;
 const HOTKEY_ID_F8: usize = 2;
 const TARGET_TRACK_TIMER_ID: usize = 1;
 const TARGET_TRACK_INTERVAL_MS: w.UINT = 20;
-const MAX_VISIBLE_ROWS: usize = 4;
 const LIST_TOP: c_int = 8;
-const CARD_HEIGHT: c_int = 80;
-const ROW_STEP: c_int = 84;
+const CARD_GAP: c_int = 4;
+const TEXT_LINE_H: c_int = 20;
+const TEXT_PAD_V: c_int = 20; // 10 top + 10 bottom
+const MAX_TEXT_LINES: usize = 5;
+const MAX_WRAP_CHARS: usize = 40;
+const IMAGE_CARD_H: c_int = 160;
+const BOTTOM_MARGIN: c_int = 8;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 var g_history = history.History.init(120);
@@ -333,6 +337,7 @@ fn togglePicker() void {
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     _ = w.ShowWindow(g_picker_hwnd, w.SW_SHOW);
     _ = w.SetForegroundWindow(g_picker_hwnd);
+    _ = w.SetFocus(g_picker_hwnd);
     dbgLog("picker shown by hotkey", .{});
 }
 
@@ -403,7 +408,7 @@ fn pasteSelection() void {
     };
 
     g_ignore_clipboard_updates = 1;
-    _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+    _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
     dbgLog("pasting selected entry", .{});
 
     const target = resolvePasteTarget();
@@ -450,20 +455,22 @@ fn paintPicker(hwnd: w.HWND) void {
         return;
     }
 
-    const visible_rows = getVisibleRows();
     const selected = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
-    const max_start = if (len > visible_rows) len - visible_rows else 0;
-    const start_from_newest = @min(g_scroll_from_newest, max_start);
-    g_scroll_from_newest = start_from_newest;
+    const client_h = rect.bottom - rect.top;
+    const start_from_newest = g_scroll_from_newest;
 
     var y: c_int = LIST_TOP;
-    var row: usize = 0;
-    while (row < visible_rows and (start_from_newest + row) < len) : (row += 1) {
-        const from_newest = start_from_newest + row;
-        const entry_idx = (len - 1) - from_newest;
-        const is_selected = from_newest == selected;
+    var visible_count: usize = 0;
+    var i: usize = start_from_newest;
+    while (i < len) : (i += 1) {
+        const entry_idx = (len - 1) - i;
+        const entry = g_history.entries.items[entry_idx];
+        const card_h = entryCardHeight(entry);
+        if (y + card_h > client_h - BOTTOM_MARGIN and visible_count > 0) break;
 
-        const row_rect = w.RECT{ .left = 12, .top = y, .right = rect.right - 20, .bottom = y + CARD_HEIGHT };
+        const is_selected = i == selected;
+
+        const row_rect = w.RECT{ .left = 12, .top = y, .right = rect.right - 20, .bottom = y + card_h };
         const row_brush = w.CreateSolidBrush(if (is_selected) color_card_selected else color_card);
         if (row_brush != null) {
             _ = w.FillRect(hdc, &row_rect, row_brush);
@@ -471,8 +478,8 @@ fn paintPicker(hwnd: w.HWND) void {
         }
 
         if (is_selected) {
-            const bar_h: c_int = 20;
-            const bar_top = y + @divTrunc(CARD_HEIGHT - bar_h, 2);
+            const bar_h: c_int = @min(20, card_h - 8);
+            const bar_top = y + @divTrunc(card_h - bar_h, 2);
             const accent_rect = w.RECT{ .left = 12, .top = bar_top, .right = 15, .bottom = bar_top + bar_h };
             const accent_brush = w.CreateSolidBrush(color_accent);
             if (accent_brush != null) {
@@ -481,11 +488,14 @@ fn paintPicker(hwnd: w.HWND) void {
             }
         }
 
-        renderEntryLine(hdc, row_rect, g_history.entries.items[entry_idx], color_text_main, color_text_sub);
-        y += ROW_STEP;
+        renderEntryLine(hdc, row_rect, entry, color_text_main, color_text_sub);
+        y += card_h + CARD_GAP;
+        visible_count += 1;
     }
 
-    drawScrollbar(hdc, rect, len, start_from_newest, visible_rows);
+    if (visible_count > 0) {
+        drawScrollbar(hdc, rect, len, start_from_newest, visible_count);
+    }
 }
 
 fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_main: w.COLORREF, color_text_sub: w.COLORREF) void {
@@ -496,12 +506,12 @@ fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_ma
     switch (entry.item) {
         .text => |text| {
             _ = w.SetTextColor(hdc, color_text_main);
-            var lines: [3][120]u8 = [_][120]u8{[_]u8{0} ** 120} ** 3;
-            const lens = wrapTextIntoLines(text, &lines, 3, 44);
+            var lines: [MAX_TEXT_LINES][120]u8 = [_][120]u8{[_]u8{0} ** 120} ** MAX_TEXT_LINES;
+            const lens = wrapTextIntoLines(text, &lines, MAX_TEXT_LINES, MAX_WRAP_CHARS);
             var li: usize = 0;
             while (li < lens.len) : (li += 1) {
                 if (lens[li] == 0) break;
-                drawUtf8Line(hdc, text_x, text_y + @as(c_int, @intCast(li * 20)), lines[li][0..lens[li]]);
+                drawUtf8Line(hdc, text_x, text_y + @as(c_int, @intCast(li)) * TEXT_LINE_H, lines[li][0..lens[li]]);
             }
         },
         .image => |img| {
@@ -509,7 +519,7 @@ fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_ma
                 .left = rect.left + 12,
                 .top = rect.top + 8,
                 .right = rect.right - 12,
-                .bottom = rect.top + 72,
+                .bottom = rect.bottom - 8,
             };
             drawImageThumbnail(hdc, thumb_rect, img);
         },
@@ -539,7 +549,7 @@ fn sanitizeAndClipInto(dst: []u8, src: []const u8, max_chars: usize) usize {
 }
 
 fn wrapTextIntoLines(src: []const u8, lines: anytype, max_lines: usize, max_chars: usize) []usize {
-    var lengths: [3]usize = [_]usize{0} ** 3;
+    var lengths: [8]usize = [_]usize{0} ** 8;
     var sanitized: [512]u8 = undefined;
     const n = sanitizeInto(&sanitized, src);
     const text = sanitized[0..n];
@@ -660,20 +670,23 @@ fn trackForegroundTarget() void {
 }
 
 fn pollHotkeyFallback() void {
-    const ctrl_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
-    const alt_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_MENU)));
-    const b_state = w.GetAsyncKeyState(@intCast(w.VK_B));
-    const b_pressed_since_last_poll = lowBitSet(b_state);
-
-    if (ctrl_down and alt_down and b_pressed_since_last_poll) {
-        dbgLog("fallback combo detected: Ctrl+Alt+B", .{});
-        togglePicker();
+    // Only poll combos that are NOT registered as hotkeys to avoid double-toggle.
+    if (!std.mem.eql(u8, g_hotkey_label, "Ctrl+Alt+B")) {
+        const ctrl_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
+        const alt_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_MENU)));
+        const b_state = w.GetAsyncKeyState(@intCast(w.VK_B));
+        if (ctrl_down and alt_down and lowBitSet(b_state)) {
+            dbgLog("fallback combo detected: Ctrl+Alt+B", .{});
+            togglePicker();
+        }
     }
 
-    const f8_state = w.GetAsyncKeyState(@intCast(w.VK_F8));
-    if (lowBitSet(f8_state)) {
-        dbgLog("fallback key detected: F8", .{});
-        togglePicker();
+    if (!g_f8_hotkey_registered) {
+        const f8_state = w.GetAsyncKeyState(@intCast(w.VK_F8));
+        if (lowBitSet(f8_state)) {
+            dbgLog("fallback key detected: F8", .{});
+            togglePicker();
+        }
     }
 }
 
@@ -725,24 +738,20 @@ fn hitTestEntryFromLParam(lp: w.LPARAM) ?usize {
     const len = g_history.len();
     if (len == 0) return null;
 
-    const y = getYFromLParam(lp);
-    const list_top: i32 = LIST_TOP;
-    const row_height: i32 = CARD_HEIGHT;
-    const row_step: i32 = ROW_STEP;
-    if (y < list_top) return null;
+    const click_y = getYFromLParam(lp);
+    if (click_y < LIST_TOP) return null;
 
-    const rel = y - list_top;
-    const row = @divTrunc(rel, row_step);
-    const visible_rows = getVisibleRows();
-    if (row < 0 or row >= visible_rows) return null;
-    if (@mod(rel, row_step) >= row_height) return null;
+    var y: c_int = LIST_TOP;
+    var i: usize = g_scroll_from_newest;
+    while (i < len) : (i += 1) {
+        const entry_idx = (len - 1) - i;
+        const card_h = entryCardHeight(g_history.entries.items[entry_idx]);
+        if (click_y >= y and click_y < y + card_h) return i;
+        y += card_h + CARD_GAP;
+        if (y > 2000) break; // safety
+    }
 
-    const max_start = if (len > visible_rows) len - visible_rows else 0;
-    const start_from_newest = @min(g_scroll_from_newest, max_start);
-    const from_newest = start_from_newest + @as(usize, @intCast(row));
-    if (from_newest >= len) return null;
-
-    return from_newest;
+    return null;
 }
 
 fn getYFromLParam(lp: w.LPARAM) i32 {
@@ -754,9 +763,8 @@ fn getYFromLParam(lp: w.LPARAM) i32 {
 
 fn scrollBy(delta: i32) void {
     const len = g_history.len();
-    const visible_rows = getVisibleRows();
-    if (len <= visible_rows) return;
-    const max_start: i32 = @intCast(len - visible_rows);
+    if (len == 0) return;
+    const max_start: i32 = @intCast(len - 1);
     var next: i32 = @intCast(g_scroll_from_newest);
     next += delta;
     if (next < 0) next = 0;
@@ -767,13 +775,38 @@ fn scrollBy(delta: i32) void {
 
 fn ensureSelectionVisible() void {
     const len = g_history.len();
-    const visible_rows = getVisibleRows();
     if (len == 0) return;
+
+    // If selection is above scroll position, scroll up to it
     if (g_selected_from_newest < g_scroll_from_newest) {
         g_scroll_from_newest = g_selected_from_newest;
-    } else if (g_selected_from_newest >= g_scroll_from_newest + visible_rows) {
-        g_scroll_from_newest = g_selected_from_newest - visible_rows + 1;
+        return;
     }
+
+    // If selection is below visible area, scroll down until it fits
+    const client_h = getClientHeight();
+    var y: c_int = LIST_TOP;
+    var i: usize = g_scroll_from_newest;
+    while (i < len) : (i += 1) {
+        const entry_idx = (len - 1) - i;
+        const card_h = entryCardHeight(g_history.entries.items[entry_idx]);
+        if (i == g_selected_from_newest) {
+            if (y + card_h > client_h - BOTTOM_MARGIN) {
+                // Selection doesn't fit, scroll down
+                g_scroll_from_newest += 1;
+                return ensureSelectionVisible();
+            }
+            return; // visible
+        }
+        y += card_h + CARD_GAP;
+    }
+}
+
+fn getClientHeight() c_int {
+    if (g_picker_hwnd == null) return 480;
+    var rect: w.RECT = .{};
+    if (w.GetClientRect(g_picker_hwnd, &rect) == 0) return 480;
+    return rect.bottom - rect.top;
 }
 
 fn drawScrollbar(hdc: w.HDC, rect: w.RECT, total: usize, start: usize, visible_rows: usize) void {
@@ -804,16 +837,20 @@ fn drawScrollbar(hdc: w.HDC, rect: w.RECT, total: usize, start: usize, visible_r
     }
 }
 
-fn getVisibleRows() usize {
-    if (g_picker_hwnd == null) return MAX_VISIBLE_ROWS;
-    var rect: w.RECT = .{};
-    if (w.GetClientRect(g_picker_hwnd, &rect) == 0) return MAX_VISIBLE_ROWS;
-
-    const usable_h: i32 = (rect.bottom - rect.top) - LIST_TOP - 8;
-    if (usable_h <= CARD_HEIGHT) return 1;
-    const rows: i32 = @divTrunc(usable_h + (ROW_STEP - CARD_HEIGHT), ROW_STEP);
-    if (rows <= 1) return 1;
-    return @intCast(rows);
+fn entryCardHeight(entry: history.Entry) c_int {
+    return switch (entry.item) {
+        .text => |text| blk: {
+            var lines: [MAX_TEXT_LINES][120]u8 = [_][120]u8{[_]u8{0} ** 120} ** MAX_TEXT_LINES;
+            const lens = wrapTextIntoLines(text, &lines, MAX_TEXT_LINES, MAX_WRAP_CHARS);
+            var count: c_int = 0;
+            for (lens) |l| {
+                if (l > 0) count += 1;
+            }
+            if (count == 0) count = 1;
+            break :blk count * TEXT_LINE_H + TEXT_PAD_V;
+        },
+        .image => IMAGE_CARD_H,
+    };
 }
 
 fn getWheelDelta(wparam: w.WPARAM) i16 {

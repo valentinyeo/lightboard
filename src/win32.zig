@@ -233,6 +233,7 @@ pub extern "user32" fn GetSystemMenu(hWnd: HWND, bRevert: BOOL) callconv(WINAPI)
 pub extern "user32" fn DeleteMenu(hMenu: HMENU, uPosition: UINT, uFlags: UINT) callconv(WINAPI) BOOL;
 pub extern "user32" fn DrawMenuBar(hWnd: HWND) callconv(WINAPI) BOOL;
 pub extern "user32" fn SetForegroundWindow(hWnd: HWND) callconv(WINAPI) BOOL;
+pub extern "user32" fn SetFocus(hWnd: HWND) callconv(WINAPI) HWND;
 pub extern "user32" fn GetForegroundWindow() callconv(WINAPI) HWND;
 pub extern "user32" fn GetCursorPos(lpPoint: *POINT) callconv(WINAPI) BOOL;
 pub extern "user32" fn GetWindowRect(hWnd: HWND, lpRect: *RECT) callconv(WINAPI) BOOL;
