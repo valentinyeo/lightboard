@@ -19,6 +19,7 @@ pub const Item = union(enum) {
 pub const Entry = struct {
     ts_unix: i64,
     item: Item,
+    sticky: bool = false,
 };
 
 pub const History = struct {
@@ -54,10 +55,41 @@ pub const History = struct {
 
         try self.entries.append(allocator, entry);
         while (self.entries.items.len > self.max_items) {
-            const removed = self.entries.orderedRemove(0);
-            switch (removed.item) {
-                .text => |text| allocator.free(text),
-                .image => |image| allocator.free(image.data),
+            // Find first non-sticky entry from oldest end to evict
+            var evict_idx: ?usize = null;
+            for (self.entries.items, 0..) |e, ei| {
+                if (!e.sticky) {
+                    evict_idx = ei;
+                    break;
+                }
+            }
+            if (evict_idx) |idx| {
+                const removed = self.entries.orderedRemove(idx);
+                switch (removed.item) {
+                    .text => |text| allocator.free(text),
+                    .image => |image| allocator.free(image.data),
+                }
+            } else {
+                // All entries are sticky — allow buffer to exceed max
+                break;
+            }
+        }
+    }
+
+    pub fn removeAt(self: *History, allocator: std.mem.Allocator, idx: usize) void {
+        if (idx >= self.entries.items.len) return;
+        const removed = self.entries.orderedRemove(idx);
+        freeEntryData(allocator, removed);
+    }
+
+    pub fn clearNonSticky(self: *History, allocator: std.mem.Allocator) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (!self.entries.items[i].sticky) {
+                const removed = self.entries.orderedRemove(i);
+                freeEntryData(allocator, removed);
+            } else {
+                i += 1;
             }
         }
     }
@@ -76,7 +108,16 @@ pub const History = struct {
     }
 };
 
-const file_magic = "LBRD1";
+fn freeEntryData(allocator: std.mem.Allocator, entry: Entry) void {
+    switch (entry.item) {
+        .text => |text| allocator.free(text),
+        .image => |image| allocator.free(image.data),
+    }
+}
+
+const file_magic_v1 = "LBRD1";
+const file_magic_v2 = "LBRD2";
+const file_magic = file_magic_v2;
 
 pub fn saveToFile(self: *const History, path: []const u8) !void {
     const cwd = std.fs.cwd();
@@ -88,6 +129,8 @@ pub fn saveToFile(self: *const History, path: []const u8) !void {
 
     for (self.entries.items) |entry| {
         try writeIntLe(file, i64, entry.ts_unix);
+        const flags: u8 = if (entry.sticky) 1 else 0;
+        try file.writeAll(&[_]u8{flags});
         switch (entry.item) {
             .text => |text| {
                 try file.writeAll(&[_]u8{1});
@@ -124,14 +167,17 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
     var stream = std.io.fixedBufferStream(blob);
     const reader = stream.reader();
 
-    var magic_buf: [file_magic.len]u8 = undefined;
+    var magic_buf: [5]u8 = undefined;
     _ = try reader.readAll(&magic_buf);
-    if (!std.mem.eql(u8, &magic_buf, file_magic)) return error.InvalidData;
+    const is_v2 = std.mem.eql(u8, &magic_buf, file_magic_v2);
+    const is_v1 = std.mem.eql(u8, &magic_buf, file_magic_v1);
+    if (!is_v1 and !is_v2) return error.InvalidData;
 
     const count = try reader.readInt(u32, .little);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const ts_unix = try reader.readInt(i64, .little);
+        const sticky: bool = if (is_v2) (try reader.readByte()) & 1 != 0 else false;
         const kind = try reader.readByte();
 
         if (kind == 1) {
@@ -142,6 +188,7 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
             try self.push(allocator, .{
                 .ts_unix = ts_unix,
                 .item = .{ .text = text },
+                .sticky = sticky,
             });
         } else if (kind == 2) {
             const fmt_byte = try reader.readByte();
@@ -158,6 +205,7 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
             try self.push(allocator, .{
                 .ts_unix = ts_unix,
                 .item = .{ .image = .{ .format = fmt, .data = data } },
+                .sticky = sticky,
             });
         } else {
             return error.InvalidData;

@@ -357,6 +357,7 @@ fn togglePicker() void {
 }
 
 fn handlePickerKey(key: w.UINT) void {
+    const ctrl_held = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
     switch (key) {
         w.VK_ESCAPE => {
             _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
@@ -382,6 +383,19 @@ fn handlePickerKey(key: w.UINT) void {
         },
         w.VK_NEXT => {
             scrollBy(4);
+        },
+        w.VK_DELETE => {
+            if (ctrl_held) {
+                deleteAllNonSticky();
+            } else {
+                deleteSelected();
+            }
+        },
+        w.VK_X => {
+            deleteSelected();
+        },
+        w.VK_S => {
+            toggleSticky();
         },
         else => {},
     }
@@ -436,6 +450,58 @@ fn pasteSelection() void {
     }
 
     clip.sendCtrlV();
+}
+
+fn deleteSelected() void {
+    const allocator = gpa.allocator();
+    const len = g_history.len();
+    if (len == 0) return;
+
+    const from_newest = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
+    const idx = (len - 1) - from_newest;
+
+    g_history.removeAt(allocator, idx);
+    dbgLog("deleted entry idx={d} from_newest={d}", .{ idx, from_newest });
+
+    // Adjust selection: keep same position, but clamp to new bounds
+    const new_len = g_history.len();
+    if (new_len == 0) {
+        g_selected_from_newest = 0;
+        g_scroll_from_newest = 0;
+    } else {
+        if (g_selected_from_newest >= new_len) {
+            g_selected_from_newest = new_len - 1;
+        }
+        if (g_scroll_from_newest >= new_len) {
+            g_scroll_from_newest = if (new_len > 0) new_len - 1 else 0;
+        }
+    }
+
+    _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+    persistHistory();
+}
+
+fn deleteAllNonSticky() void {
+    const allocator = gpa.allocator();
+    g_history.clearNonSticky(allocator);
+    g_selected_from_newest = 0;
+    g_scroll_from_newest = 0;
+    dbgLog("deleted all non-sticky entries, remaining={d}", .{g_history.len()});
+    _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+    persistHistory();
+}
+
+fn toggleSticky() void {
+    const len = g_history.len();
+    if (len == 0) return;
+
+    const from_newest = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
+    const idx = (len - 1) - from_newest;
+
+    g_history.entries.items[idx].sticky = !g_history.entries.items[idx].sticky;
+    dbgLog("toggled sticky idx={d} now={}", .{ idx, g_history.entries.items[idx].sticky });
+    _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+    persistHistory();
 }
 
 fn paintPicker(hwnd: w.HWND) void {
@@ -503,7 +569,7 @@ fn paintPicker(hwnd: w.HWND) void {
             }
         }
 
-        renderEntryLine(hdc, row_rect, entry, color_text_main, color_text_sub);
+        renderEntryLine(hdc, row_rect, entry, color_text_main, color_text_sub, color_accent);
         y += card_h + CARD_GAP;
         visible_count += 1;
     }
@@ -513,10 +579,16 @@ fn paintPicker(hwnd: w.HWND) void {
     }
 }
 
-fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_main: w.COLORREF, color_text_sub: w.COLORREF) void {
+fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_main: w.COLORREF, color_text_sub: w.COLORREF, color_accent: w.COLORREF) void {
     _ = color_text_sub;
     const text_x = rect.left + 14;
     const text_y = rect.top + 10;
+
+    // Draw sticky pin indicator in top-right corner
+    if (entry.sticky) {
+        _ = w.SetTextColor(hdc, color_accent);
+        drawUtf8Line(hdc, rect.right - 18, rect.top + 4, "*");
+    }
 
     switch (entry.item) {
         .text => |text| {

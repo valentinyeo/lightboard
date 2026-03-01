@@ -46,7 +46,7 @@ Lightboard is a Windows clipboard history manager written in pure Zig with no ex
 
 - **`src/main.zig`** - Application entry point, Win32 message loop, window management, hotkey registration, picker UI rendering (GDI paint), keyboard/mouse input handling, debug logging, and persistence orchestration. Contains all global state as file-level `var` declarations.
 - **`src/clipboard.zig`** - Clipboard read/write operations. `capture()` reads current clipboard content (text or image). `restoreToClipboard()` writes an entry back. `sendCtrlV()` synthesizes a Ctrl+V keystroke via `SendInput`.
-- **`src/history.zig`** - Data model (`Entry`, `Item`, `ImageMeta`, `History`) and binary persistence. History is a bounded ring buffer (default 120 entries) with consecutive duplicate suppression. File format uses `"LBRD1"` magic header with little-endian integers.
+- **`src/history.zig`** - Data model (`Entry`, `Item`, `ImageMeta`, `History`) and binary persistence. History is a bounded ring buffer (default 120 entries) with consecutive duplicate suppression. File format uses `"LBRD2"` magic header with little-endian integers (backward-compatible with `"LBRD1"`).
 - **`src/win32.zig`** - Hand-written Win32 FFI bindings (types, constants, extern function declarations). No auto-generated bindings - add new Win32 functions here as needed.
 
 ### Key Patterns
@@ -57,6 +57,20 @@ Lightboard is a Windows clipboard history manager written in pure Zig with no ex
 - **Target window tracking**: Continuously tracks the foreground window so paste can restore focus to the correct app after picker selection.
 - **Picker rendering**: Custom GDI paint in `paintPicker()` - dark theme, card-style layout, scrollbar, text wrapping, and DIB thumbnail rendering for images.
 - **Persistence**: Auto-saves to `%LOCALAPPDATA%\lightboard\history.bin` on every capture and at shutdown. Custom binary format (not JSON).
+- **Sticky entries**: Entries can be pinned/sticky. Sticky entries survive eviction when history is full and survive "delete all". Shown with a `*` accent indicator in top-right of card.
+
+### Picker Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Up` / `k` | Move selection up |
+| `Down` / `j` | Move selection down |
+| `Enter` | Paste selected entry |
+| `Esc` | Hide picker |
+| `PageUp` / `PageDown` | Scroll by 4 |
+| `Delete` or `x` | Delete selected entry |
+| `Ctrl+Delete` | Delete all non-sticky entries |
+| `s` | Toggle sticky/pin on selected entry |
 
 ### Debug Logging
 
