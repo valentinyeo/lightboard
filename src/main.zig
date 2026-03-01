@@ -237,6 +237,14 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
                 return 0;
             }
         },
+        w.WM_ACTIVATE => {
+            if (g_picker_hwnd != null and hwnd == g_picker_hwnd) {
+                if ((wparam & 0xFFFF) != w.WA_INACTIVE) {
+                    _ = w.SetFocus(g_picker_hwnd);
+                }
+                return 0;
+            }
+        },
         w.WM_KEYDOWN => {
             if (g_picker_hwnd != null and hwnd == g_picker_hwnd) {
                 handlePickerKey(@intCast(wparam));
@@ -251,11 +259,29 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
         },
         w.WM_LBUTTONDOWN => {
             if (g_picker_hwnd != null and hwnd == g_picker_hwnd) {
-                if (hitTestEntryFromLParam(lparam)) |from_newest| {
-                    g_selected_from_newest = from_newest;
-                    ensureSelectionVisible();
-                    _ = w.InvalidateRect(g_picker_hwnd, null, 1);
-                    pasteSelection();
+                const click_x = getXFromLParam(lparam);
+                const click_y = getYFromLParam(lparam);
+                if (hitTestClick(click_x, click_y)) |hit| {
+                    switch (hit.zone) {
+                        .delete => {
+                            g_selected_from_newest = hit.from_newest;
+                            deleteSelected();
+                        },
+                        .pin => {
+                            const hlen = g_history.len();
+                            const entry_idx = (hlen - 1) - hit.from_newest;
+                            g_history.entries.items[entry_idx].sticky = !g_history.entries.items[entry_idx].sticky;
+                            g_selected_from_newest = hit.from_newest;
+                            _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+                            persistHistory();
+                        },
+                        .body => {
+                            g_selected_from_newest = hit.from_newest;
+                            ensureSelectionVisible();
+                            _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+                            pasteSelection();
+                        },
+                    }
                     return 0;
                 }
             }
@@ -351,6 +377,7 @@ fn togglePicker() void {
     g_scroll_from_newest = 0;
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     _ = w.ShowWindow(g_picker_hwnd, w.SW_SHOW);
+    _ = w.BringWindowToTop(g_picker_hwnd);
     _ = w.SetForegroundWindow(g_picker_hwnd);
     _ = w.SetFocus(g_picker_hwnd);
     dbgLog("picker shown by hotkey", .{});
@@ -580,15 +607,23 @@ fn paintPicker(hwnd: w.HWND) void {
 }
 
 fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_main: w.COLORREF, color_text_sub: w.COLORREF, color_accent: w.COLORREF) void {
-    _ = color_text_sub;
     const text_x = rect.left + 14;
     const text_y = rect.top + 10;
+    const color_icon_dim = w.RGB(100, 100, 100);
 
-    // Draw sticky pin indicator in top-right corner
+    // Draw pin icon (always visible, top-right area)
+    // U+25CF BLACK CIRCLE when sticky, U+25CB WHITE CIRCLE when not
     if (entry.sticky) {
         _ = w.SetTextColor(hdc, color_accent);
-        drawUtf8Line(hdc, rect.right - 18, rect.top + 4, "*");
+        drawUtf8Line(hdc, rect.right - 42, rect.top + 4, "\xE2\x97\x8F");
+    } else {
+        _ = w.SetTextColor(hdc, color_icon_dim);
+        drawUtf8Line(hdc, rect.right - 42, rect.top + 4, "\xE2\x97\x8B");
     }
+
+    // Draw delete icon × (U+00D7) — always visible
+    _ = w.SetTextColor(hdc, color_text_sub);
+    drawUtf8Line(hdc, rect.right - 20, rect.top + 4, "\xC3\x97");
 
     switch (entry.item) {
         .text => |text| {
@@ -846,6 +881,47 @@ fn hitTestEntryFromLParam(lp: w.LPARAM) ?usize {
     }
 
     return null;
+}
+
+const ClickZone = enum { body, pin, delete };
+const HitResult = struct { from_newest: usize, zone: ClickZone };
+
+fn hitTestClick(click_x: i32, click_y: i32) ?HitResult {
+    const len = g_history.len();
+    if (len == 0) return null;
+    if (click_y < LIST_TOP) return null;
+
+    var client_rect: w.RECT = .{};
+    if (g_picker_hwnd != null) _ = w.GetClientRect(g_picker_hwnd, &client_rect);
+    const card_right = client_rect.right - 20;
+
+    var y: c_int = LIST_TOP;
+    var i: usize = g_scroll_from_newest;
+    while (i < len) : (i += 1) {
+        const entry_idx = (len - 1) - i;
+        const card_h = entryCardHeight(g_history.entries.items[entry_idx]);
+        if (click_y >= y and click_y < y + card_h) {
+            // Check delete icon area (right side)
+            if (click_x >= card_right - 28 and click_x <= card_right - 4 and click_y < y + 24) {
+                return .{ .from_newest = i, .zone = .delete };
+            }
+            // Check pin icon area (left of delete)
+            if (click_x >= card_right - 52 and click_x < card_right - 28 and click_y < y + 24) {
+                return .{ .from_newest = i, .zone = .pin };
+            }
+            return .{ .from_newest = i, .zone = .body };
+        }
+        y += card_h + CARD_GAP;
+        if (y > 2000) break;
+    }
+    return null;
+}
+
+fn getXFromLParam(lp: w.LPARAM) i32 {
+    const raw: usize = @bitCast(lp);
+    const x16: u16 = @truncate(raw);
+    const x_i16: i16 = @bitCast(x16);
+    return x_i16;
 }
 
 fn getYFromLParam(lp: w.LPARAM) i32 {
