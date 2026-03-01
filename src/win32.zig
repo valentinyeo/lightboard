@@ -300,6 +300,32 @@ pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(WINAPI) HBRUSH;
 pub extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(WINAPI) BOOL;
 pub extern "dwmapi" fn DwmSetWindowAttribute(hwnd: HWND, dwAttribute: DWORD, pvAttribute: *const anyopaque, cbAttribute: DWORD) callconv(WINAPI) i32;
 
+pub const HHOOK = ?*anyopaque;
+pub const WH_KEYBOARD_LL: INT = 13;
+pub const HC_ACTION: INT = 0;
+pub const WM_KEYDOWN_LL: UINT = 0x0100;
+pub const WM_KEYUP_LL: UINT = 0x0101;
+pub const WM_SYSKEYDOWN: UINT = 0x0104;
+pub const WM_SYSKEYUP: UINT = 0x0105;
+pub const WM_APP: UINT = 0x8000;
+pub const VK_LWIN: UINT = 0x5B;
+pub const VK_RWIN: UINT = 0x5C;
+pub const LLKHF_INJECTED: DWORD = 0x00000010;
+
+pub const KBDLLHOOKSTRUCT = extern struct {
+    vkCode: DWORD,
+    scanCode: DWORD,
+    flags: DWORD,
+    time: DWORD,
+    dwExtraInfo: usize,
+};
+
+pub const HOOKPROC = *const fn (INT, WPARAM, LPARAM) callconv(WINAPI) LRESULT;
+pub extern "user32" fn SetWindowsHookExW(idHook: INT, lpfn: HOOKPROC, hmod: HINSTANCE, dwThreadId: DWORD) callconv(WINAPI) HHOOK;
+pub extern "user32" fn CallNextHookEx(hhk: HHOOK, nCode: INT, wParam: WPARAM, lParam: LPARAM) callconv(WINAPI) LRESULT;
+pub extern "user32" fn UnhookWindowsHookEx(hhk: HHOOK) callconv(WINAPI) BOOL;
+pub extern "user32" fn PostMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(WINAPI) BOOL;
+
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWORD = 20;
 pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWORD = 33;
 pub const DWMWA_CAPTION_COLOR: DWORD = 35;

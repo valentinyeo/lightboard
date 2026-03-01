@@ -36,6 +36,8 @@ var g_history_path: []u8 = &[_]u8{};
 var g_prev_left_down = false;
 var g_timer_logged = false;
 var g_hotkey_debounce: i64 = 0; // timestamp of last toggle to prevent rapid re-toggle
+var g_kb_hook: w.HHOOK = null; // low-level keyboard hook for Win+V
+var g_win_key_down: bool = false; // tracking Win key state for the hook
 
 pub fn main() !void {
     initDebugLog();
@@ -143,7 +145,17 @@ pub fn main() !void {
     _ = w.SetTimer(g_message_hwnd, TARGET_TRACK_TIMER_ID, TARGET_TRACK_INTERVAL_MS, null);
     defer _ = w.KillTimer(g_message_hwnd, TARGET_TRACK_TIMER_ID);
 
-    if (registerHotkey()) {
+    // Try low-level keyboard hook for Win+V first (bypasses Windows shell reservation)
+    const winv_hooked = installWinVHook();
+    defer {
+        if (g_kb_hook != null) _ = w.UnhookWindowsHookEx(g_kb_hook);
+    }
+    if (winv_hooked) {
+        g_hotkey_label = "Win+V";
+        g_hotkey_registered = true;
+        std.log.info("lightboard running (Win+V opens picker via LL hook)", .{});
+        dbgLog("hotkey active: Win+V (LL hook)", .{});
+    } else if (registerHotkey()) {
         defer _ = w.UnregisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID));
         std.log.info("lightboard running ({s} opens picker)", .{g_hotkey_label});
         dbgLog("hotkey active: {s}", .{g_hotkey_label});
@@ -184,6 +196,44 @@ pub fn main() !void {
     }
 }
 
+fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.WINAPI) w.LRESULT {
+    if (nCode == w.HC_ACTION) {
+        const kb: *const w.KBDLLHOOKSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
+        const msg = @as(w.UINT, @intCast(wParam));
+
+        // Track Win key state
+        if (kb.vkCode == w.VK_LWIN or kb.vkCode == w.VK_RWIN) {
+            if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
+                g_win_key_down = true;
+            } else if (msg == w.WM_KEYUP_LL or msg == w.WM_SYSKEYUP) {
+                g_win_key_down = false;
+            }
+        }
+
+        // Intercept Win+V: swallow both keydown and keyup of V while Win is held
+        if (kb.vkCode == w.VK_V and g_win_key_down) {
+            if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
+                // Only toggle on keydown, post message to our window
+                _ = w.PostMessageW(g_message_hwnd, w.WM_APP, 0, 0);
+                dbgLog("LL hook: Win+V intercepted, posting WM_APP", .{});
+            }
+            return 1; // swallow the keystroke
+        }
+    }
+    return w.CallNextHookEx(g_kb_hook, nCode, wParam, lParam);
+}
+
+fn installWinVHook() bool {
+    g_kb_hook = w.SetWindowsHookExW(w.WH_KEYBOARD_LL, llKeyboardProc, w.GetModuleHandleW(null), 0);
+    if (g_kb_hook != null) {
+        dbgLog("installed LL keyboard hook for Win+V", .{});
+        return true;
+    } else {
+        dbgLog("failed LL keyboard hook winerr={d}", .{w.GetLastError()});
+        return false;
+    }
+}
+
 fn registerHotkey() bool {
     const candidates = [_]struct {
         mods: w.UINT,
@@ -191,7 +241,6 @@ fn registerHotkey() bool {
         label: []const u8,
     }{
         .{ .mods = w.MOD_CONTROL | w.MOD_ALT, .vk = w.VK_B, .label = "Ctrl+Alt+B" },
-        .{ .mods = w.MOD_WIN, .vk = w.VK_V, .label = "Win+V" },
         .{ .mods = w.MOD_CONTROL | w.MOD_SHIFT, .vk = w.VK_V, .label = "Ctrl+Shift+V" },
         .{ .mods = w.MOD_CONTROL | w.MOD_ALT, .vk = w.VK_V, .label = "Ctrl+Alt+V" },
         .{ .mods = w.MOD_ALT, .vk = w.VK_V, .label = "Alt+V" },
@@ -215,6 +264,16 @@ fn registerHotkey() bool {
 
 fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callconv(w.WINAPI) w.LRESULT {
     switch (msg) {
+        w.WM_APP => {
+            // Win+V intercepted by low-level keyboard hook
+            dbgLog("WM_APP: Win+V hook toggle", .{});
+            const now = std.time.milliTimestamp();
+            if (now - g_hotkey_debounce >= 300) {
+                g_hotkey_debounce = now;
+                togglePicker();
+            }
+            return 0;
+        },
         w.WM_HOTKEY => {
             // WM_HOTKEY delivery is unreliable on some systems; polling handles it.
             // Just log if we ever receive one (for diagnostics).
