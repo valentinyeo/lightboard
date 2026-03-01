@@ -75,6 +75,7 @@ pub const VK_DELETE: UINT = 0x2E;
 pub const VK_S: UINT = 0x53;
 pub const VK_X: UINT = 0x58;
 pub const VK_F8: UINT = 0x77;
+pub const VK_F24: u16 = 0x87;
 pub const WHITE_BRUSH: INT = 0;
 pub const GMEM_MOVEABLE: UINT = 0x0002;
 pub const GMEM_ZEROINIT: UINT = 0x0040;

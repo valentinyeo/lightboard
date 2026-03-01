@@ -201,6 +201,11 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
         const kb: *const w.KBDLLHOOKSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
         const msg = @as(w.UINT, @intCast(wParam));
 
+        // Ignore our own injected dummy keystrokes
+        if (kb.vkCode == w.VK_F24 and (kb.flags & w.LLKHF_INJECTED) != 0) {
+            return w.CallNextHookEx(g_kb_hook, nCode, wParam, lParam);
+        }
+
         // Track Win key state
         if (kb.vkCode == w.VK_LWIN or kb.vkCode == w.VK_RWIN) {
             if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
@@ -213,7 +218,15 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
         // Intercept Win+V: swallow both keydown and keyup of V while Win is held
         if (kb.vkCode == w.VK_V and g_win_key_down) {
             if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
-                // Only toggle on keydown, post message to our window
+                // Inject a dummy key (F24) press+release to prevent Start menu.
+                // Windows opens Start when Win is pressed and released with no
+                // other key consumed. The dummy keystroke poisons that detection.
+                var dummy = [2]w.INPUT{
+                    .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{ .wVk = w.VK_F24 } } },
+                    .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{ .wVk = w.VK_F24, .dwFlags = w.KEYEVENTF_KEYUP } } },
+                };
+                _ = w.SendInput(2, &dummy, @sizeOf(w.INPUT));
+
                 _ = w.PostMessageW(g_message_hwnd, w.WM_APP, 0, 0);
                 dbgLog("LL hook: Win+V intercepted, posting WM_APP", .{});
             }
