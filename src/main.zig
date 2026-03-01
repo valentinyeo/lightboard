@@ -377,13 +377,35 @@ fn togglePicker() void {
     g_scroll_from_newest = 0;
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     _ = w.ShowWindow(g_picker_hwnd, w.SW_SHOW);
-    _ = w.BringWindowToTop(g_picker_hwnd);
-    _ = w.SetForegroundWindow(g_picker_hwnd);
-    _ = w.SetFocus(g_picker_hwnd);
+    forceForeground(g_picker_hwnd);
     dbgLog("picker shown by hotkey", .{});
 }
 
+fn forceForeground(hwnd: w.HWND) void {
+    const fg_hwnd = w.GetForegroundWindow();
+    const my_tid = w.GetCurrentThreadId();
+
+    if (fg_hwnd != null and fg_hwnd != hwnd) {
+        const fg_tid = w.GetWindowThreadProcessId(fg_hwnd, null);
+        if (fg_tid != 0 and fg_tid != my_tid) {
+            _ = w.AttachThreadInput(my_tid, fg_tid, 1);
+            _ = w.BringWindowToTop(hwnd);
+            _ = w.SetForegroundWindow(hwnd);
+            _ = w.SetFocus(hwnd);
+            _ = w.AttachThreadInput(my_tid, fg_tid, 0);
+            dbgLog("forceForeground: attached tid={d} to fg_tid={d}", .{ my_tid, fg_tid });
+            return;
+        }
+    }
+
+    _ = w.BringWindowToTop(hwnd);
+    _ = w.SetForegroundWindow(hwnd);
+    _ = w.SetFocus(hwnd);
+    dbgLog("forceForeground: direct (no thread attach needed)", .{});
+}
+
 fn handlePickerKey(key: w.UINT) void {
+    dbgLog("handlePickerKey vk=0x{X:0>2}", .{key});
     const ctrl_held = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
     switch (key) {
         w.VK_ESCAPE => {
