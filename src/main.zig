@@ -34,6 +34,8 @@ var g_last_target_hwnd: w.HWND = null;
 var g_ui_font: w.HFONT = null;
 var g_history_path: []u8 = &[_]u8{};
 var g_prev_left_down = false;
+var g_timer_logged = false;
+var g_hotkey_debounce: i64 = 0; // timestamp of last toggle to prevent rapid re-toggle
 
 pub fn main() !void {
     initDebugLog();
@@ -159,7 +161,17 @@ pub fn main() !void {
     }
 
     var msg: w.MSG = .{};
+    var loop_count: u64 = 0;
     while (w.GetMessageW(&msg, null, 0, 0) > 0) {
+        loop_count += 1;
+        // Log first few iterations to confirm loop is running
+        if (loop_count <= 3) {
+            dbgLog("msg loop iter={d} msg=0x{X:0>4} hwnd={d}", .{ loop_count, msg.message, @intFromPtr(msg.hwnd) });
+        }
+        // Always log WM_HOTKEY in the loop
+        if (msg.message == w.WM_HOTKEY) {
+            dbgLog("WM_HOTKEY in loop wparam={d} hwnd={d}", .{ msg.wParam, @intFromPtr(msg.hwnd) });
+        }
         if (msg.message == w.WM_MOUSEWHEEL and g_picker_hwnd != null and w.IsWindowVisible(g_picker_hwnd) != 0) {
             const delta = getWheelDelta(msg.wParam);
             const steps: i32 = @intCast(@max(@as(u32, 1), @divTrunc(@as(u32, @intCast(@abs(@as(i32, delta)))), @as(u32, 120))));
@@ -204,11 +216,10 @@ fn registerHotkey() bool {
 fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callconv(w.WINAPI) w.LRESULT {
     switch (msg) {
         w.WM_HOTKEY => {
-            if (wparam == HOTKEY_ID or wparam == HOTKEY_ID_F8) {
-                dbgLog("WM_HOTKEY received id={d}", .{wparam});
-                togglePicker();
-                return 0;
-            }
+            // WM_HOTKEY delivery is unreliable on some systems; polling handles it.
+            // Just log if we ever receive one (for diagnostics).
+            dbgLog("WM_HOTKEY received id={d} (ignored, poll handles it)", .{wparam});
+            return 0;
         },
         w.WM_CLIPBOARDUPDATE => {
             onClipboardUpdate();
@@ -216,6 +227,10 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
         },
         w.WM_TIMER => {
             if (wparam == TARGET_TRACK_TIMER_ID) {
+                if (!g_timer_logged) {
+                    g_timer_logged = true;
+                    dbgLog("WM_TIMER first tick confirmed", .{});
+                }
                 trackForegroundTarget();
                 pollHotkeyFallback();
                 hideOnOutsideClick();
@@ -670,23 +685,30 @@ fn trackForegroundTarget() void {
 }
 
 fn pollHotkeyFallback() void {
-    // Only poll combos that are NOT registered as hotkeys to avoid double-toggle.
-    if (!std.mem.eql(u8, g_hotkey_label, "Ctrl+Alt+B")) {
-        const ctrl_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
-        const alt_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_MENU)));
-        const b_state = w.GetAsyncKeyState(@intCast(w.VK_B));
-        if (ctrl_down and alt_down and lowBitSet(b_state)) {
-            dbgLog("fallback combo detected: Ctrl+Alt+B", .{});
-            togglePicker();
-        }
+    // Always poll hotkeys via GetAsyncKeyState because WM_HOTKEY delivery
+    // is unreliable on some Windows configurations. Use timestamp debounce
+    // to prevent rapid re-toggle (300ms cooldown).
+    const now = std.time.milliTimestamp();
+    if (now - g_hotkey_debounce < 300) return;
+
+    // Check Ctrl+Alt+B
+    const ctrl_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
+    const alt_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_MENU)));
+    const b_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_B)));
+    if (ctrl_down and alt_down and b_down) {
+        dbgLog("poll detected: Ctrl+Alt+B", .{});
+        g_hotkey_debounce = now;
+        togglePicker();
+        return;
     }
 
-    if (!g_f8_hotkey_registered) {
-        const f8_state = w.GetAsyncKeyState(@intCast(w.VK_F8));
-        if (lowBitSet(f8_state)) {
-            dbgLog("fallback key detected: F8", .{});
-            togglePicker();
-        }
+    // Check F8
+    const f8_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_F8)));
+    if (f8_down) {
+        dbgLog("poll detected: F8", .{});
+        g_hotkey_debounce = now;
+        togglePicker();
+        return;
     }
 }
 
