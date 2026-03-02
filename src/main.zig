@@ -2,6 +2,7 @@ const std = @import("std");
 const w = @import("win32.zig");
 const clip = @import("clipboard.zig");
 const history = @import("history.zig");
+const img_store = @import("image_store.zig");
 
 const MESSAGE_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_msg");
 const PICKER_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_picker");
@@ -21,7 +22,7 @@ const IMAGE_CARD_H: c_int = 160;
 const BOTTOM_MARGIN: c_int = 8;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-var g_history = history.History.init(120);
+var g_history = history.History.init(20);
 var g_message_hwnd: w.HWND = null;
 var g_picker_hwnd: w.HWND = null;
 var g_hotkey_label: []const u8 = "Win+V";
@@ -34,6 +35,7 @@ var g_f8_hotkey_registered = false;
 var g_last_target_hwnd: w.HWND = null;
 var g_ui_font: w.HFONT = null;
 var g_history_path: []u8 = &[_]u8{};
+var g_images_dir_path: []u8 = &[_]u8{};
 var g_prev_left_down = false;
 var g_timer_logged = false;
 var g_hotkey_debounce: i64 = 0; // timestamp of last toggle to prevent rapid re-toggle
@@ -58,6 +60,8 @@ pub fn main() !void {
     const allocator = gpa.allocator();
     try initPersistence(allocator);
     defer if (g_history_path.len > 0) allocator.free(g_history_path);
+    defer if (g_images_dir_path.len > 0) allocator.free(g_images_dir_path);
+    defer img_store.deinit(allocator);
     defer g_history.deinit(allocator);
     defer persistHistory();
 
@@ -437,7 +441,7 @@ fn onClipboardUpdate() void {
         g_history.push(allocator, entry) catch |err| {
             std.log.err("history push failed: {s}", .{@errorName(err)});
             if (entry.item == .text) allocator.free(entry.item.text);
-            if (entry.item == .image) allocator.free(entry.item.image.data);
+            if (entry.item == .image) img_store.delete(entry.item.image.file_id);
             return;
         };
 
@@ -449,8 +453,8 @@ fn onClipboardUpdate() void {
                 dbgLog("captured text len={d} total={d}", .{ text.len, total });
             },
             .image => |img| {
-                std.log.info("captured image [{d}] {s} bytes={d}", .{ total, @tagName(img.format), img.data.len });
-                dbgLog("captured image format={s} bytes={d} total={d}", .{ @tagName(img.format), img.data.len, total });
+                std.log.info("captured image [{d}] {s} raw={d}", .{ total, @tagName(img.format), img.raw_size });
+                dbgLog("captured image format={s} raw={d} fid={d} total={d}", .{ @tagName(img.format), img.raw_size, img.file_id, total });
             },
         }
 
@@ -591,7 +595,7 @@ fn pasteSelection() void {
     const result = filteredEntry(from_newest) orelse return;
     const selected = result.entry;
 
-    clip.restoreToClipboard(selected) catch |err| {
+    clip.restoreToClipboard(gpa.allocator(), selected) catch |err| {
         std.log.err("restore clipboard failed: {s} winerr={d}", .{ @errorName(err), w.GetLastError() });
         dbgLog("restore clipboard failed: {s} winerr={d}", .{ @errorName(err), w.GetLastError() });
         return;
@@ -629,13 +633,22 @@ fn openSelectedImage() void {
         },
     };
 
+    const allocator = gpa.allocator();
+
+    // Load raw image data from disk
+    const raw_data = img_store.load(allocator, img.file_id, img.raw_size) catch |err| {
+        dbgLog("failed to load image for preview: {s}", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(raw_data);
+
     // Write BMP file: 14-byte BITMAPFILEHEADER + DIB data
     const bmp_header_size: u32 = 14;
-    const dib_header_size: u32 = if (img.data.len >= 4)
-        std.mem.readInt(u32, img.data[0..4], .little)
+    const dib_header_size: u32 = if (raw_data.len >= 4)
+        std.mem.readInt(u32, raw_data[0..4], .little)
     else
         0;
-    const file_size: u32 = bmp_header_size + @as(u32, @intCast(img.data.len));
+    const file_size: u32 = bmp_header_size + @as(u32, @intCast(raw_data.len));
     const pixel_offset: u32 = bmp_header_size + dib_header_size;
 
     var header: [14]u8 = undefined;
@@ -647,7 +660,6 @@ fn openSelectedImage() void {
     std.mem.writeInt(u32, header[10..14], pixel_offset, .little);
 
     // Write to %LOCALAPPDATA%\lightboard\preview.bmp
-    const allocator = gpa.allocator();
     const local_app_data = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch {
         dbgLog("LOCALAPPDATA not found, can't open image", .{});
         return;
@@ -664,7 +676,7 @@ fn openSelectedImage() void {
     defer file.close();
 
     file.writeAll(&header) catch return;
-    file.writeAll(img.data) catch return;
+    file.writeAll(raw_data) catch return;
 
     dbgLog("wrote preview.bmp, opening with shell", .{});
 
@@ -916,7 +928,12 @@ fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_ma
                 .right = rect.right - 12,
                 .bottom = rect.bottom - 8,
             };
-            drawImageThumbnail(hdc, thumb_rect, img);
+            const raw_data = img_store.load(gpa.allocator(), img.file_id, img.raw_size) catch {
+                drawUtf8Line(hdc, rect.left + 12, rect.top + 8, "[image load failed]");
+                return;
+            };
+            defer gpa.allocator().free(raw_data);
+            drawImageThumbnail(hdc, thumb_rect, raw_data);
         },
     }
 }
@@ -982,10 +999,10 @@ fn wrapTextIntoLines(src: []const u8, lines: anytype, max_lines: usize, max_char
     return lengths[0..max_lines];
 }
 
-fn drawImageThumbnail(hdc: w.HDC, rect: w.RECT, image: history.ImageMeta) void {
-    if (image.data.len < @sizeOf(w.BITMAPINFOHEADER)) return;
+fn drawImageThumbnail(hdc: w.HDC, rect: w.RECT, data: []const u8) void {
+    if (data.len < @sizeOf(w.BITMAPINFOHEADER)) return;
 
-    const header: *const w.BITMAPINFOHEADER = @ptrCast(@alignCast(image.data.ptr));
+    const header: *const w.BITMAPINFOHEADER = @ptrCast(@alignCast(data.ptr));
     if (header.biSize < @sizeOf(w.BITMAPINFOHEADER)) return;
     if (header.biWidth == 0 or header.biHeight == 0) return;
 
@@ -996,9 +1013,9 @@ fn drawImageThumbnail(hdc: w.HDC, rect: w.RECT, image: history.ImageMeta) void {
     }
 
     const pixel_offset = @as(usize, @intCast(header.biSize)) + color_table_bytes;
-    if (pixel_offset >= image.data.len) return;
+    if (pixel_offset >= data.len) return;
 
-    const bits_ptr: *const anyopaque = @ptrCast(image.data.ptr + pixel_offset);
+    const bits_ptr: *const anyopaque = @ptrCast(data.ptr + pixel_offset);
     const bmi: *const w.BITMAPINFO = @ptrCast(@alignCast(header));
 
     const src_w: c_int = @intCast(@abs(header.biWidth));
@@ -1352,6 +1369,13 @@ fn initPersistence(allocator: std.mem.Allocator) !void {
 
     g_history_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, "history.bin" });
     dbgLog("persistence path: {s}", .{g_history_path});
+
+    // Set up images directory and compression workspace
+    const images_dir = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, "images" });
+    try std.fs.cwd().makePath(images_dir);
+    g_images_dir_path = images_dir;
+    img_store.init(allocator, images_dir);
+    dbgLog("images dir: {s}", .{images_dir});
 }
 
 fn persistHistory() void {

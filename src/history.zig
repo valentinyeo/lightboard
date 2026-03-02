@@ -1,4 +1,5 @@
 const std = @import("std");
+const img_store = @import("image_store.zig");
 
 pub const ImageFormat = enum {
     dibv5,
@@ -8,7 +9,8 @@ pub const ImageFormat = enum {
 
 pub const ImageMeta = struct {
     format: ImageFormat,
-    data: []u8,
+    file_id: i64,
+    raw_size: u32,
 };
 
 pub const Item = union(enum) {
@@ -32,10 +34,7 @@ pub const History = struct {
 
     pub fn deinit(self: *History, allocator: std.mem.Allocator) void {
         for (self.entries.items) |entry| {
-            switch (entry.item) {
-                .text => |text| allocator.free(text),
-                .image => |image| allocator.free(image.data),
-            }
+            freeEntryData(allocator, entry);
         }
         self.entries.deinit(allocator);
     }
@@ -46,10 +45,7 @@ pub const History = struct {
 
     pub fn push(self: *History, allocator: std.mem.Allocator, entry: Entry) !void {
         if (self.entries.items.len > 0 and isDuplicate(self.entries.items[self.entries.items.len - 1], entry)) {
-            switch (entry.item) {
-                .text => |text| allocator.free(text),
-                .image => |image| allocator.free(image.data),
-            }
+            freeEntryData(allocator, entry);
             return;
         }
 
@@ -65,10 +61,7 @@ pub const History = struct {
             }
             if (evict_idx) |idx| {
                 const removed = self.entries.orderedRemove(idx);
-                switch (removed.item) {
-                    .text => |text| allocator.free(text),
-                    .image => |image| allocator.free(image.data),
-                }
+                freeEntryData(allocator, removed);
             } else {
                 // All entries are sticky — allow buffer to exceed max
                 break;
@@ -100,10 +93,8 @@ pub const History = struct {
                 .text => |bt| std.mem.eql(u8, at, bt),
                 else => false,
             },
-            .image => |ai| switch (b.item) {
-                .image => |bi| ai.format == bi.format and std.mem.eql(u8, ai.data, bi.data),
-                else => false,
-            },
+            // Can't cheaply compare disk-stored images; skip dup check
+            .image => false,
         };
     }
 };
@@ -111,13 +102,14 @@ pub const History = struct {
 fn freeEntryData(allocator: std.mem.Allocator, entry: Entry) void {
     switch (entry.item) {
         .text => |text| allocator.free(text),
-        .image => |image| allocator.free(image.data),
+        .image => |image| img_store.delete(image.file_id),
     }
 }
 
 const file_magic_v1 = "LBRD1";
 const file_magic_v2 = "LBRD2";
-const file_magic = file_magic_v2;
+const file_magic_v3 = "LBRD3";
+const file_magic = file_magic_v3;
 
 pub fn saveToFile(self: *const History, path: []const u8) !void {
     const cwd = std.fs.cwd();
@@ -140,8 +132,8 @@ pub fn saveToFile(self: *const History, path: []const u8) !void {
             .image => |image| {
                 try file.writeAll(&[_]u8{2});
                 try file.writeAll(&[_]u8{@intFromEnum(image.format)});
-                try writeIntLe(file, u32, @intCast(image.data.len));
-                try file.writeAll(image.data);
+                try writeIntLe(file, i64, image.file_id);
+                try writeIntLe(file, u32, image.raw_size);
             },
         }
     }
@@ -157,7 +149,7 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
 
     const stat = try file.stat();
     const file_size: usize = @intCast(stat.size);
-    if (file_size < file_magic.len + 4) return;
+    if (file_size < 5 + 4) return;
 
     const blob = try allocator.alloc(u8, file_size);
     defer allocator.free(blob);
@@ -169,20 +161,22 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
 
     var magic_buf: [5]u8 = undefined;
     _ = try reader.readAll(&magic_buf);
+    const is_v3 = std.mem.eql(u8, &magic_buf, file_magic_v3);
     const is_v2 = std.mem.eql(u8, &magic_buf, file_magic_v2);
     const is_v1 = std.mem.eql(u8, &magic_buf, file_magic_v1);
-    if (!is_v1 and !is_v2) return error.InvalidData;
+    if (!is_v1 and !is_v2 and !is_v3) return error.InvalidData;
 
     const count = try reader.readInt(u32, .little);
     var i: u32 = 0;
     while (i < count) : (i += 1) {
         const ts_unix = try reader.readInt(i64, .little);
-        const sticky: bool = if (is_v2) (try reader.readByte()) & 1 != 0 else false;
+        const sticky: bool = if (is_v1) false else (try reader.readByte()) & 1 != 0;
         const kind = try reader.readByte();
 
         if (kind == 1) {
-            const len = try reader.readInt(u32, .little);
-            const text = try allocator.alloc(u8, len);
+            // Text entry — same across all versions
+            const text_len = try reader.readInt(u32, .little);
+            const text = try allocator.alloc(u8, text_len);
             errdefer allocator.free(text);
             _ = try reader.readAll(text);
             try self.push(allocator, .{
@@ -192,21 +186,39 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
             });
         } else if (kind == 2) {
             const fmt_byte = try reader.readByte();
-            const len = try reader.readInt(u32, .little);
-            const data = try allocator.alloc(u8, len);
-            errdefer allocator.free(data);
-            _ = try reader.readAll(data);
             const fmt: ImageFormat = switch (fmt_byte) {
                 @intFromEnum(ImageFormat.dibv5) => .dibv5,
                 @intFromEnum(ImageFormat.dib) => .dib,
                 @intFromEnum(ImageFormat.bitmap) => .bitmap,
                 else => .dib,
             };
-            try self.push(allocator, .{
-                .ts_unix = ts_unix,
-                .item = .{ .image = .{ .format = fmt, .data = data } },
-                .sticky = sticky,
-            });
+
+            if (is_v3) {
+                // V3: metadata only (image data on disk)
+                const fid = try reader.readInt(i64, .little);
+                const raw_size = try reader.readInt(u32, .little);
+                try self.push(allocator, .{
+                    .ts_unix = ts_unix,
+                    .item = .{ .image = .{ .format = fmt, .file_id = fid, .raw_size = raw_size } },
+                    .sticky = sticky,
+                });
+            } else {
+                // V1/V2: inline image data — migrate to disk
+                const data_len = try reader.readInt(u32, .little);
+                const raw_data = try allocator.alloc(u8, data_len);
+                defer allocator.free(raw_data);
+                _ = try reader.readAll(raw_data);
+
+                const file_id = img_store.nextFileId();
+                _ = img_store.save(allocator, raw_data, file_id) catch {
+                    continue; // skip image if compression/save fails
+                };
+                try self.push(allocator, .{
+                    .ts_unix = ts_unix,
+                    .item = .{ .image = .{ .format = fmt, .file_id = file_id, .raw_size = @intCast(data_len) } },
+                    .sticky = sticky,
+                });
+            }
         } else {
             return error.InvalidData;
         }

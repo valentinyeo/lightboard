@@ -343,3 +343,34 @@ pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWORD = 33;
 pub const DWMWA_CAPTION_COLOR: DWORD = 35;
 pub const DWMWA_TEXT_COLOR: DWORD = 36;
 pub const DWMWCP_ROUND: DWORD = 2;
+
+// ntdll compression (LZNT1)
+pub const COMPRESSION_FORMAT_LZNT1: u16 = 0x0002;
+pub const COMPRESSION_ENGINE_STANDARD: u16 = 0x0000;
+pub const COMPRESSION_ENGINE_MAXIMUM: u16 = 0x0100;
+
+pub extern "ntdll" fn RtlCompressBuffer(
+    CompressionFormatAndEngine: u16,
+    UncompressedBuffer: [*]const u8,
+    UncompressedBufferSize: DWORD,
+    CompressedBuffer: [*]u8,
+    CompressedBufferSize: DWORD,
+    UncompressedChunkSize: DWORD,
+    FinalCompressedSize: *DWORD,
+    WorkSpace: *anyopaque,
+) callconv(WINAPI) c_long;
+
+pub extern "ntdll" fn RtlDecompressBuffer(
+    CompressionFormat: u16,
+    UncompressedBuffer: [*]u8,
+    UncompressedBufferSize: DWORD,
+    CompressedBuffer: [*]const u8,
+    CompressedBufferSize: DWORD,
+    FinalUncompressedSize: *DWORD,
+) callconv(WINAPI) c_long;
+
+pub extern "ntdll" fn RtlGetCompressionWorkSpaceSize(
+    CompressionFormatAndEngine: u16,
+    CompressBufferWorkSpaceSize: *DWORD,
+    CompressFragmentWorkSpaceSize: *DWORD,
+) callconv(WINAPI) c_long;

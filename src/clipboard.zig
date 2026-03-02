@@ -1,9 +1,15 @@
 const std = @import("std");
 const w = @import("win32.zig");
 const history = @import("history.zig");
+const img_store = @import("image_store.zig");
 
 const max_text_bytes: usize = 20 * 1024;
-const max_image_bytes: usize = 8 * 1024 * 1024;
+const max_image_bytes: usize = 2 * 1024 * 1024;
+
+const RawImage = struct {
+    format: history.ImageFormat,
+    data: []u8,
+};
 
 pub fn capture(allocator: std.mem.Allocator) !?history.Entry {
     if (w.OpenClipboard(null) == 0) return null;
@@ -19,17 +25,26 @@ pub fn capture(allocator: std.mem.Allocator) !?history.Entry {
         }
     }
 
-    if (try readImage(allocator)) |image| {
+    if (try readImage(allocator)) |raw_img| {
+        defer allocator.free(raw_img.data);
+
+        const file_id = img_store.nextFileId();
+        _ = try img_store.save(allocator, raw_img.data, file_id);
+
         return history.Entry{
             .ts_unix = std.time.timestamp(),
-            .item = .{ .image = image },
+            .item = .{ .image = .{
+                .format = raw_img.format,
+                .file_id = file_id,
+                .raw_size = @intCast(raw_img.data.len),
+            } },
         };
     }
 
     return null;
 }
 
-pub fn restoreToClipboard(entry: history.Entry) !void {
+pub fn restoreToClipboard(allocator: std.mem.Allocator, entry: history.Entry) !void {
     if (w.OpenClipboard(null) == 0) return error.OpenClipboardFailed;
     defer _ = w.CloseClipboard();
 
@@ -37,7 +52,11 @@ pub fn restoreToClipboard(entry: history.Entry) !void {
 
     switch (entry.item) {
         .text => |text| try setText(text),
-        .image => |image| try setImage(image),
+        .image => |image| {
+            const data = try img_store.load(allocator, image.file_id, image.raw_size);
+            defer allocator.free(data);
+            try setImageData(image.format, data);
+        },
     }
 }
 
@@ -52,7 +71,7 @@ pub fn sendCtrlV() void {
     _ = w.SendInput(inputs.len, &inputs, @sizeOf(w.INPUT));
 }
 
-fn readImage(allocator: std.mem.Allocator) !?history.ImageMeta {
+fn readImage(allocator: std.mem.Allocator) !?RawImage {
     const formats = [_]struct { format_id: w.UINT, kind: history.ImageFormat }{
         .{ .format_id = w.CF_DIBV5, .kind = .dibv5 },
         .{ .format_id = w.CF_DIB, .kind = .dib },
@@ -93,11 +112,11 @@ fn readUnicodeText(allocator: std.mem.Allocator) !?[]u8 {
     const u16_len_cap = byte_size / 2;
     const wide: [*]const u16 = @ptrCast(@alignCast(raw_ptr));
 
-    var len: usize = 0;
-    while (len < u16_len_cap and wide[len] != 0) : (len += 1) {}
-    if (len == 0) return null;
+    var text_len: usize = 0;
+    while (text_len < u16_len_cap and wide[text_len] != 0) : (text_len += 1) {}
+    if (text_len == 0) return null;
 
-    var text = try std.unicode.utf16LeToUtf8Alloc(allocator, wide[0..len]);
+    var text = try std.unicode.utf16LeToUtf8Alloc(allocator, wide[0..text_len]);
     if (text.len > max_text_bytes) {
         text = try allocator.realloc(text, max_text_bytes);
     }
@@ -124,15 +143,15 @@ fn setText(text: []const u8) !void {
     }
 }
 
-fn setImage(image: history.ImageMeta) !void {
-    const mem = w.GlobalAlloc(w.GMEM_MOVEABLE, image.data.len) orelse return error.GlobalAllocFailed;
+fn setImageData(format: history.ImageFormat, data: []const u8) !void {
+    const mem = w.GlobalAlloc(w.GMEM_MOVEABLE, data.len) orelse return error.GlobalAllocFailed;
     const raw = w.GlobalLock(mem) orelse return error.GlobalLockFailed;
     defer _ = w.GlobalUnlock(mem);
 
     const dst: [*]u8 = @ptrCast(@alignCast(raw));
-    @memcpy(dst[0..image.data.len], image.data);
+    @memcpy(dst[0..data.len], data);
 
-    const format_id: w.UINT = switch (image.format) {
+    const format_id: w.UINT = switch (format) {
         .dibv5 => w.CF_DIBV5,
         .dib => w.CF_DIB,
         .bitmap => w.CF_DIB,
