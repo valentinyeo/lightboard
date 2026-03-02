@@ -227,6 +227,23 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
             }
             return 1; // swallow the keystroke
         }
+
+        // While Win is held and picker is visible, intercept navigation keys
+        // so the shell doesn't process them as Win+Arrow/etc.
+        if (g_win_key_down and g_picker_hwnd != null and w.IsWindowVisible(g_picker_hwnd) != 0) {
+            const vk = @as(w.UINT, @intCast(kb.vkCode));
+            const is_nav = (vk == w.VK_UP or vk == w.VK_DOWN or
+                vk == w.VK_J or vk == w.VK_K or
+                vk == w.VK_RETURN or vk == w.VK_ESCAPE or
+                vk == w.VK_PRIOR or vk == w.VK_NEXT or
+                vk == w.VK_DELETE or vk == w.VK_X or vk == w.VK_S);
+            if (is_nav) {
+                if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
+                    _ = w.PostMessageW(g_picker_hwnd, w.WM_KEYDOWN, vk, 0);
+                }
+                return 1; // swallow so shell doesn't get Win+Arrow etc.
+            }
+        }
     }
     return w.CallNextHookEx(g_kb_hook, nCode, wParam, lParam);
 }
