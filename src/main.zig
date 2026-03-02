@@ -38,7 +38,6 @@ var g_timer_logged = false;
 var g_hotkey_debounce: i64 = 0; // timestamp of last toggle to prevent rapid re-toggle
 var g_kb_hook: w.HHOOK = null; // low-level keyboard hook for Win+V
 var g_win_key_down: bool = false; // tracking Win key state for the hook
-var g_ate_winv: bool = false; // true if we consumed Win+V during current Win hold
 
 pub fn main() !void {
     initDebugLog();
@@ -201,7 +200,6 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
     if (nCode == w.HC_ACTION) {
         const kb: *const w.KBDLLHOOKSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
         const msg = @as(w.UINT, @intCast(wParam));
-        const is_injected = (kb.flags & w.LLKHF_INJECTED) != 0;
 
         // Track Win key state
         if (kb.vkCode == w.VK_LWIN or kb.vkCode == w.VK_RWIN) {
@@ -209,27 +207,21 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
                 g_win_key_down = true;
             } else if (msg == w.WM_KEYUP_LL or msg == w.WM_SYSKEYUP) {
                 g_win_key_down = false;
-                // If we consumed Win+V during this hold, suppress the real
-                // Win key-up (prevents Start menu) and inject a synthetic one
-                // (LLKHF_INJECTED flag makes the shell ignore it).
-                if (g_ate_winv and !is_injected) {
-                    g_ate_winv = false;
-                    var up = [1]w.INPUT{
-                        .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{
-                            .wVk = @intCast(kb.vkCode),
-                            .dwFlags = w.KEYEVENTF_KEYUP,
-                        } } },
-                    };
-                    _ = w.SendInput(1, &up, @sizeOf(w.INPUT));
-                    return 1; // swallow the real key-up
-                }
             }
         }
 
         // Intercept Win+V: swallow both keydown and keyup of V while Win is held
         if (kb.vkCode == w.VK_V and g_win_key_down) {
             if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
-                g_ate_winv = true;
+                // Inject Shift press+release to cancel Start menu detection.
+                // The shell won't open Start if any non-Win key was pressed
+                // during the Win hold. Shift is completely inert with Win alone.
+                var dummy = [2]w.INPUT{
+                    .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{ .wVk = w.VK_LSHIFT } } },
+                    .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{ .wVk = w.VK_LSHIFT, .dwFlags = w.KEYEVENTF_KEYUP } } },
+                };
+                _ = w.SendInput(2, &dummy, @sizeOf(w.INPUT));
+
                 _ = w.PostMessageW(g_message_hwnd, w.WM_APP, 0, 0);
                 dbgLog("LL hook: Win+V intercepted, posting WM_APP", .{});
             }
