@@ -71,6 +71,11 @@ Lightboard is a Windows clipboard history manager written in pure Zig with no ex
 | `Delete` or `x` | Delete selected entry |
 | `Ctrl+Delete` | Delete all non-sticky entries |
 | `s` | Toggle sticky/pin on selected entry |
+| `Tab` | Switch between History and Pinned tabs |
+
+### Tab View
+
+The picker has two tabs: **History** (default) and **Pinned**. The History tab shows non-sticky entries, the Pinned tab shows sticky entries only. Press `Tab` to switch between them, or click the tab labels at the top. Selection and scroll reset on tab switch. Toggling sticky (`s`) on an entry moves it to the other tab.
 
 ### Debug Logging
 

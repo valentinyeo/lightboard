@@ -10,7 +10,8 @@ const HOTKEY_ID: usize = 1;
 const HOTKEY_ID_F8: usize = 2;
 const TARGET_TRACK_TIMER_ID: usize = 1;
 const TARGET_TRACK_INTERVAL_MS: w.UINT = 20;
-const LIST_TOP: c_int = 8;
+const TAB_Y: c_int = 8;
+const LIST_TOP: c_int = 32;
 const CARD_GAP: c_int = 4;
 const TEXT_LINE_H: c_int = 20;
 const TEXT_PAD_V: c_int = 20; // 10 top + 10 bottom
@@ -38,6 +39,9 @@ var g_timer_logged = false;
 var g_hotkey_debounce: i64 = 0; // timestamp of last toggle to prevent rapid re-toggle
 var g_kb_hook: w.HHOOK = null; // low-level keyboard hook for Win+V
 var g_win_key_down: bool = false; // tracking Win key state for the hook
+
+const ActiveTab = enum { history, pinned };
+var g_active_tab: ActiveTab = .history;
 
 pub fn main() !void {
     initDebugLog();
@@ -345,6 +349,21 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
             if (g_picker_hwnd != null and hwnd == g_picker_hwnd) {
                 const click_x = getXFromLParam(lparam);
                 const click_y = getYFromLParam(lparam);
+                // Tab bar click detection
+                if (click_y >= TAB_Y and click_y < LIST_TOP) {
+                    if (click_x >= 16 and click_x < 80) {
+                        g_active_tab = .history;
+                        g_selected_from_newest = 0;
+                        g_scroll_from_newest = 0;
+                        _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+                    } else if (click_x >= 80 and click_x < 150) {
+                        g_active_tab = .pinned;
+                        g_selected_from_newest = 0;
+                        g_scroll_from_newest = 0;
+                        _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+                    }
+                    return 0;
+                }
                 if (hitTestClick(click_x, click_y)) |hit| {
                     switch (hit.zone) {
                         .delete => {
@@ -352,12 +371,8 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
                             deleteSelected();
                         },
                         .pin => {
-                            const hlen = g_history.len();
-                            const entry_idx = (hlen - 1) - hit.from_newest;
-                            g_history.entries.items[entry_idx].sticky = !g_history.entries.items[entry_idx].sticky;
                             g_selected_from_newest = hit.from_newest;
-                            _ = w.InvalidateRect(g_picker_hwnd, null, 1);
-                            persistHistory();
+                            toggleSticky();
                         },
                         .body => {
                             g_selected_from_newest = hit.from_newest;
@@ -523,7 +538,9 @@ fn handlePickerKey(key: w.UINT) void {
         },
         w.VK_DELETE => {
             if (ctrl_held) {
-                deleteAllNonSticky();
+                if (g_active_tab == .history) {
+                    deleteAllNonSticky();
+                }
             } else {
                 deleteSelected();
             }
@@ -533,6 +550,13 @@ fn handlePickerKey(key: w.UINT) void {
         },
         w.VK_S => {
             toggleSticky();
+        },
+        w.VK_TAB => {
+            g_active_tab = if (g_active_tab == .history) .pinned else .history;
+            g_selected_from_newest = 0;
+            g_scroll_from_newest = 0;
+            _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+            dbgLog("tab switched to {s}", .{if (g_active_tab == .history) "history" else "pinned"});
         },
         else => {},
     }
@@ -545,7 +569,7 @@ fn handlePickerChar(ch: w.UINT) void {
 }
 
 fn moveSelection(delta: i32) void {
-    const len = g_history.len();
+    const len = filteredCount();
     if (len == 0) return;
 
     var next = @as(i32, @intCast(g_selected_from_newest)) + delta;
@@ -560,12 +584,12 @@ fn moveSelection(delta: i32) void {
 }
 
 fn pasteSelection() void {
-    const len = g_history.len();
-    if (len == 0) return;
+    const flen = filteredCount();
+    if (flen == 0) return;
 
-    const from_newest = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
-    const idx = (len - 1) - from_newest;
-    const selected = g_history.entries.items[idx];
+    const from_newest = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
+    const result = filteredEntry(from_newest) orelse return;
+    const selected = result.entry;
 
     clip.restoreToClipboard(selected) catch |err| {
         std.log.err("restore clipboard failed: {s} winerr={d}", .{ @errorName(err), w.GetLastError() });
@@ -590,12 +614,12 @@ fn pasteSelection() void {
 }
 
 fn openSelectedImage() void {
-    const len = g_history.len();
-    if (len == 0) return;
+    const flen = filteredCount();
+    if (flen == 0) return;
 
-    const from_newest = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
-    const idx = (len - 1) - from_newest;
-    const selected = g_history.entries.items[idx];
+    const from_newest = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
+    const result = filteredEntry(from_newest) orelse return;
+    const selected = result.entry;
 
     const img = switch (selected.item) {
         .image => |image| image,
@@ -667,26 +691,26 @@ fn openSelectedImage() void {
 
 fn deleteSelected() void {
     const allocator = gpa.allocator();
-    const len = g_history.len();
-    if (len == 0) return;
+    const flen = filteredCount();
+    if (flen == 0) return;
 
-    const from_newest = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
-    const idx = (len - 1) - from_newest;
+    const from_newest = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
+    const r = filteredEntry(from_newest) orelse return;
 
-    g_history.removeAt(allocator, idx);
-    dbgLog("deleted entry idx={d} from_newest={d}", .{ idx, from_newest });
+    g_history.removeAt(allocator, r.real_idx);
+    dbgLog("deleted entry idx={d} from_newest={d}", .{ r.real_idx, from_newest });
 
-    // Adjust selection: keep same position, but clamp to new bounds
-    const new_len = g_history.len();
-    if (new_len == 0) {
+    // Adjust selection: keep same position, but clamp to new filtered bounds
+    const new_flen = filteredCount();
+    if (new_flen == 0) {
         g_selected_from_newest = 0;
         g_scroll_from_newest = 0;
     } else {
-        if (g_selected_from_newest >= new_len) {
-            g_selected_from_newest = new_len - 1;
+        if (g_selected_from_newest >= new_flen) {
+            g_selected_from_newest = new_flen - 1;
         }
-        if (g_scroll_from_newest >= new_len) {
-            g_scroll_from_newest = if (new_len > 0) new_len - 1 else 0;
+        if (g_scroll_from_newest >= new_flen) {
+            g_scroll_from_newest = if (new_flen > 0) new_flen - 1 else 0;
         }
     }
 
@@ -705,16 +729,60 @@ fn deleteAllNonSticky() void {
 }
 
 fn toggleSticky() void {
-    const len = g_history.len();
-    if (len == 0) return;
+    const flen = filteredCount();
+    if (flen == 0) return;
 
-    const from_newest = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
-    const idx = (len - 1) - from_newest;
+    const from_newest = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
+    const r = filteredEntry(from_newest) orelse return;
 
-    g_history.entries.items[idx].sticky = !g_history.entries.items[idx].sticky;
-    dbgLog("toggled sticky idx={d} now={}", .{ idx, g_history.entries.items[idx].sticky });
+    g_history.entries.items[r.real_idx].sticky = !g_history.entries.items[r.real_idx].sticky;
+    dbgLog("toggled sticky idx={d} now={}", .{ r.real_idx, g_history.entries.items[r.real_idx].sticky });
+
+    // Entry moved to the other tab — clamp selection
+    const new_flen = filteredCount();
+    if (new_flen == 0) {
+        g_selected_from_newest = 0;
+        g_scroll_from_newest = 0;
+    } else {
+        if (g_selected_from_newest >= new_flen) {
+            g_selected_from_newest = new_flen - 1;
+        }
+        if (g_scroll_from_newest >= new_flen) {
+            g_scroll_from_newest = if (new_flen > 0) new_flen - 1 else 0;
+        }
+    }
+
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     persistHistory();
+}
+
+const FilteredResult = struct { entry: history.Entry, real_idx: usize };
+
+fn filteredCount() usize {
+    const want_sticky = g_active_tab == .pinned;
+    var count: usize = 0;
+    const len = g_history.len();
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        if (g_history.entries.items[i].sticky == want_sticky) count += 1;
+    }
+    return count;
+}
+
+fn filteredEntry(from_newest: usize) ?FilteredResult {
+    const want_sticky = g_active_tab == .pinned;
+    const len = g_history.len();
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const entry_idx = (len - 1) - i;
+        const entry = g_history.entries.items[entry_idx];
+        if (entry.sticky == want_sticky) {
+            if (count == from_newest) return .{ .entry = entry, .real_idx = entry_idx };
+            count += 1;
+        }
+    }
+    return null;
 }
 
 fn paintPicker(hwnd: w.HWND) void {
@@ -742,23 +810,42 @@ fn paintPicker(hwnd: w.HWND) void {
     _ = w.SetBkMode(hdc, w.TRANSPARENT);
     _ = w.SetTextColor(hdc, color_text_main);
 
-    const len = g_history.len();
-    if (len == 0) {
+    // Draw tab bar
+    _ = w.SetTextColor(hdc, if (g_active_tab == .history) color_accent else color_text_sub);
+    drawUtf8Line(hdc, 16, TAB_Y, "History");
+    _ = w.SetTextColor(hdc, if (g_active_tab == .pinned) color_accent else color_text_sub);
+    drawUtf8Line(hdc, 90, TAB_Y, "Pinned");
+    // Active tab underline
+    {
+        const ux: c_int = if (g_active_tab == .history) 16 else 90;
+        const uw: c_int = if (g_active_tab == .history) 54 else 48;
+        const underline = w.RECT{ .left = ux, .top = TAB_Y + 18, .right = ux + uw, .bottom = TAB_Y + 20 };
+        const u_brush = w.CreateSolidBrush(color_accent);
+        if (u_brush != null) {
+            _ = w.FillRect(hdc, &underline, u_brush);
+            _ = w.DeleteObject(u_brush);
+        }
+    }
+    _ = w.SetTextColor(hdc, color_text_main);
+
+    const flen = filteredCount();
+    if (flen == 0) {
         _ = w.SetTextColor(hdc, color_text_sub);
-        drawUtf8Line(hdc, 16, 20, "Clipboard history is empty");
+        const empty_msg = if (g_active_tab == .history) "Clipboard history is empty" else "No pinned entries";
+        drawUtf8Line(hdc, 16, LIST_TOP + 12, empty_msg);
         return;
     }
 
-    const selected = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
+    const selected = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
     const client_h = rect.bottom - rect.top;
     const start_from_newest = g_scroll_from_newest;
 
     var y: c_int = LIST_TOP;
     var visible_count: usize = 0;
     var i: usize = start_from_newest;
-    while (i < len) : (i += 1) {
-        const entry_idx = (len - 1) - i;
-        const entry = g_history.entries.items[entry_idx];
+    while (i < flen) : (i += 1) {
+        const result = filteredEntry(i) orelse break;
+        const entry = result.entry;
         const card_h = entryCardHeight(entry);
         if (y + card_h > client_h - BOTTOM_MARGIN and visible_count > 0) break;
 
@@ -788,7 +875,7 @@ fn paintPicker(hwnd: w.HWND) void {
     }
 
     if (visible_count > 0) {
-        drawScrollbar(hdc, rect, len, start_from_newest, visible_count);
+        drawScrollbar(hdc, rect, flen, start_from_newest, visible_count);
     }
 }
 
@@ -1073,7 +1160,7 @@ const ClickZone = enum { body, pin, delete };
 const HitResult = struct { from_newest: usize, zone: ClickZone };
 
 fn hitTestClick(click_x: i32, click_y: i32) ?HitResult {
-    const len = g_history.len();
+    const len = filteredCount();
     if (len == 0) return null;
     if (click_y < LIST_TOP) return null;
 
@@ -1084,8 +1171,8 @@ fn hitTestClick(click_x: i32, click_y: i32) ?HitResult {
     var y: c_int = LIST_TOP;
     var i: usize = g_scroll_from_newest;
     while (i < len) : (i += 1) {
-        const entry_idx = (len - 1) - i;
-        const card_h = entryCardHeight(g_history.entries.items[entry_idx]);
+        const r = filteredEntry(i) orelse break;
+        const card_h = entryCardHeight(r.entry);
         if (click_y >= y and click_y < y + card_h) {
             // Check delete icon area (right side)
             if (click_x >= card_right - 28 and click_x <= card_right - 4 and click_y < y + 24) {
@@ -1118,7 +1205,7 @@ fn getYFromLParam(lp: w.LPARAM) i32 {
 }
 
 fn scrollBy(delta: i32) void {
-    const len = g_history.len();
+    const len = filteredCount();
     if (len == 0) return;
     const max_start: i32 = @intCast(len - 1);
     var next: i32 = @intCast(g_scroll_from_newest);
@@ -1130,7 +1217,7 @@ fn scrollBy(delta: i32) void {
 }
 
 fn ensureSelectionVisible() void {
-    const len = g_history.len();
+    const len = filteredCount();
     if (len == 0) return;
 
     // If selection is above scroll position, scroll up to it
@@ -1144,8 +1231,8 @@ fn ensureSelectionVisible() void {
     var y: c_int = LIST_TOP;
     var i: usize = g_scroll_from_newest;
     while (i < len) : (i += 1) {
-        const entry_idx = (len - 1) - i;
-        const card_h = entryCardHeight(g_history.entries.items[entry_idx]);
+        const r = filteredEntry(i) orelse break;
+        const card_h = entryCardHeight(r.entry);
         if (i == g_selected_from_newest) {
             if (y + card_h > client_h - BOTTOM_MARGIN) {
                 // Selection doesn't fit, scroll down
@@ -1170,7 +1257,7 @@ fn drawScrollbar(hdc: w.HDC, rect: w.RECT, total: usize, start: usize, visible_r
 
     const track_left = rect.right - 6;
     const track_right = rect.right - 4;
-    const track_top: c_int = 8;
+    const track_top: c_int = LIST_TOP;
     const track_bottom: c_int = rect.bottom - 8;
     const track_h = track_bottom - track_top;
 

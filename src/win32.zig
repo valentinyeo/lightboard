@@ -73,6 +73,7 @@ pub const VK_MENU: UINT = 0x12;
 pub const VK_LBUTTON: UINT = 0x01;
 pub const VK_DELETE: UINT = 0x2E;
 pub const VK_S: UINT = 0x53;
+pub const VK_TAB: UINT = 0x09;
 pub const VK_X: UINT = 0x58;
 pub const VK_F8: UINT = 0x77;
 pub const VK_LSHIFT: u16 = 0xA0;
