@@ -40,14 +40,15 @@ When making significant changes (new features, new files, architecture changes, 
 
 ## Architecture
 
-Lightboard is a Windows clipboard history manager written in pure Zig with no external dependencies. It uses raw Win32 API calls (no Zig std GUI abstractions).
+Lightboard is a Windows clipboard history manager written in pure Zig with no external dependencies. It uses raw Win32 API calls (no Zig std GUI abstractions). Also links ntdll for LZNT1 compression.
 
 ### Source Files
 
 - **`src/main.zig`** - Application entry point, Win32 message loop, window management, hotkey registration, picker UI rendering (GDI paint), keyboard/mouse input handling, debug logging, and persistence orchestration. Contains all global state as file-level `var` declarations.
-- **`src/clipboard.zig`** - Clipboard read/write operations. `capture()` reads current clipboard content (text or image). `restoreToClipboard()` writes an entry back. `sendCtrlV()` synthesizes a Ctrl+V keystroke via `SendInput`.
-- **`src/history.zig`** - Data model (`Entry`, `Item`, `ImageMeta`, `History`) and binary persistence. History is a bounded ring buffer (default 120 entries) with consecutive duplicate suppression. File format uses `"LBRD2"` magic header with little-endian integers (backward-compatible with `"LBRD1"`).
-- **`src/win32.zig`** - Hand-written Win32 FFI bindings (types, constants, extern function declarations). No auto-generated bindings - add new Win32 functions here as needed.
+- **`src/clipboard.zig`** - Clipboard read/write operations. `capture()` reads current clipboard content (text or image), compresses images to disk. `restoreToClipboard()` loads images from disk for pasting. `sendCtrlV()` synthesizes a Ctrl+V keystroke via `SendInput`.
+- **`src/history.zig`** - Data model (`Entry`, `Item`, `ImageMeta`, `History`) and binary persistence. History is a bounded ring buffer (default 20 entries) with consecutive duplicate suppression. File format uses `"LBRD3"` magic header (backward-compatible with `"LBRD1"`/`"LBRD2"`, auto-migrates on first save).
+- **`src/image_store.zig`** - Compressed image file management. Saves raw DIB data as LZNT1-compressed `.lz` files in `%LOCALAPPDATA%\lightboard\images\`. Provides save/load/delete operations. Uses ntdll `RtlCompressBuffer`/`RtlDecompressBuffer`.
+- **`src/win32.zig`** - Hand-written Win32 FFI bindings (types, constants, extern function declarations). Includes ntdll compression functions. No auto-generated bindings - add new Win32 functions here as needed.
 
 ### Key Patterns
 
@@ -56,7 +57,8 @@ Lightboard is a Windows clipboard history manager written in pure Zig with no ex
 - **Self-trigger guard**: `g_ignore_clipboard_updates` counter prevents re-capturing items we just pasted.
 - **Target window tracking**: Continuously tracks the foreground window so paste can restore focus to the correct app after picker selection.
 - **Picker rendering**: Custom GDI paint in `paintPicker()` - dark theme, card-style layout, scrollbar, text wrapping, and DIB thumbnail rendering for images.
-- **Persistence**: Auto-saves to `%LOCALAPPDATA%\lightboard\history.bin` on every capture and at shutdown. Custom binary format (not JSON).
+- **Persistence**: Auto-saves to `%LOCALAPPDATA%\lightboard\history.bin` on every capture and at shutdown. Custom binary format (LBRD3). Images stored as compressed files in `%LOCALAPPDATA%\lightboard\images\` — not kept in RAM, loaded on demand for rendering/pasting.
+- **Image compression**: Raw DIB clipboard data is compressed with LZNT1 (Windows ntdll) before writing to disk. Typical 5-10x compression ratio for screenshots. Images are decompressed on the fly when rendering thumbnails or pasting.
 - **Sticky entries**: Entries can be pinned/sticky. Sticky entries survive eviction when history is full and survive "delete all". Shown with a `*` accent indicator in top-right of card.
 
 ### Picker Keyboard Shortcuts
