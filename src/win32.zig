@@ -328,6 +328,15 @@ pub extern "user32" fn CallNextHookEx(hhk: HHOOK, nCode: INT, wParam: WPARAM, lP
 pub extern "user32" fn UnhookWindowsHookEx(hhk: HHOOK) callconv(WINAPI) BOOL;
 pub extern "user32" fn PostMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(WINAPI) BOOL;
 
+pub extern "shell32" fn ShellExecuteW(
+    hwnd: HWND,
+    lpOperation: LPCWSTR,
+    lpFile: LPCWSTR,
+    lpParameters: LPCWSTR,
+    lpDirectory: LPCWSTR,
+    nShowCmd: INT,
+) callconv(WINAPI) isize;
+
 pub const DWMWA_USE_IMMERSIVE_DARK_MODE: DWORD = 20;
 pub const DWMWA_WINDOW_CORNER_PREFERENCE: DWORD = 33;
 pub const DWMWA_CAPTION_COLOR: DWORD = 35;

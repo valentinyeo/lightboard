@@ -509,7 +509,11 @@ fn handlePickerKey(key: w.UINT) void {
             moveSelection(1);
         },
         w.VK_RETURN => {
-            pasteSelection();
+            if (ctrl_held) {
+                openSelectedImage();
+            } else {
+                pasteSelection();
+            }
         },
         w.VK_PRIOR => {
             scrollBy(-4);
@@ -583,6 +587,82 @@ fn pasteSelection() void {
     }
 
     clip.sendCtrlV();
+}
+
+fn openSelectedImage() void {
+    const len = g_history.len();
+    if (len == 0) return;
+
+    const from_newest = if (g_selected_from_newest < len) g_selected_from_newest else len - 1;
+    const idx = (len - 1) - from_newest;
+    const selected = g_history.entries.items[idx];
+
+    const img = switch (selected.item) {
+        .image => |image| image,
+        .text => {
+            dbgLog("Ctrl+Enter on text entry, ignoring", .{});
+            return;
+        },
+    };
+
+    // Write BMP file: 14-byte BITMAPFILEHEADER + DIB data
+    const bmp_header_size: u32 = 14;
+    const dib_header_size: u32 = if (img.data.len >= 4)
+        std.mem.readInt(u32, img.data[0..4], .little)
+    else
+        0;
+    const file_size: u32 = bmp_header_size + @as(u32, @intCast(img.data.len));
+    const pixel_offset: u32 = bmp_header_size + dib_header_size;
+
+    var header: [14]u8 = undefined;
+    header[0] = 'B';
+    header[1] = 'M';
+    std.mem.writeInt(u32, header[2..6], file_size, .little);
+    std.mem.writeInt(u16, header[6..8], 0, .little);
+    std.mem.writeInt(u16, header[8..10], 0, .little);
+    std.mem.writeInt(u32, header[10..14], pixel_offset, .little);
+
+    // Write to %LOCALAPPDATA%\lightboard\preview.bmp
+    const allocator = gpa.allocator();
+    const local_app_data = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch {
+        dbgLog("LOCALAPPDATA not found, can't open image", .{});
+        return;
+    };
+    defer allocator.free(local_app_data);
+
+    const bmp_path = std.fs.path.joinZ(allocator, &.{ local_app_data, "lightboard", "preview.bmp" }) catch return;
+    defer allocator.free(bmp_path);
+
+    const file = std.fs.cwd().createFileZ(bmp_path, .{}) catch |err| {
+        dbgLog("failed to create preview.bmp: {s}", .{@errorName(err)});
+        return;
+    };
+    defer file.close();
+
+    file.writeAll(&header) catch return;
+    file.writeAll(img.data) catch return;
+
+    dbgLog("wrote preview.bmp, opening with shell", .{});
+
+    // Convert path to wide string for ShellExecuteW
+    var wide_path: [std.fs.max_path_bytes]u16 = undefined;
+    var i: usize = 0;
+    for (bmp_path) |c| {
+        wide_path[i] = c;
+        i += 1;
+    }
+    wide_path[i] = 0;
+
+    _ = w.ShellExecuteW(
+        null,
+        std.unicode.utf8ToUtf16LeStringLiteral("open"),
+        @ptrCast(&wide_path),
+        null,
+        null,
+        w.SW_SHOW,
+    );
+
+    _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
 }
 
 fn deleteSelected() void {
