@@ -209,11 +209,21 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
         const kb: *const w.KBDLLHOOKSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
         const msg = @as(w.UINT, @intCast(wParam));
 
-        // Track Win key state
+        // Track Win key state (with GetAsyncKeyState cross-check to prevent stuck state)
         if (kb.vkCode == w.VK_LWIN or kb.vkCode == w.VK_RWIN) {
             if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
                 g_win_key_down = true;
             } else if (msg == w.WM_KEYUP_LL or msg == w.WM_SYSKEYUP) {
+                g_win_key_down = false;
+            }
+        }
+
+        // Cross-check: if we think Win is down but it's physically up, fix the flag.
+        // This prevents g_win_key_down getting stuck true when a key-up event is missed.
+        if (g_win_key_down) {
+            const lwin_real = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_LWIN)));
+            const rwin_real = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_RWIN)));
+            if (!lwin_real and !rwin_real) {
                 g_win_key_down = false;
             }
         }
