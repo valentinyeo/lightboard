@@ -1,5 +1,6 @@
 const std = @import("std");
 const w = @import("win32.zig");
+const app_io = @import("app_io.zig");
 const history = @import("history.zig");
 const img_store = @import("image_store.zig");
 
@@ -19,7 +20,7 @@ pub fn capture(allocator: std.mem.Allocator) !?history.Entry {
         const maybe_text = try readUnicodeText(allocator);
         if (maybe_text) |text| {
             return history.Entry{
-                .ts_unix = std.time.timestamp(),
+                .ts_unix = app_io.unixTimestamp(),
                 .item = .{ .text = text },
             };
         }
@@ -32,11 +33,12 @@ pub fn capture(allocator: std.mem.Allocator) !?history.Entry {
         _ = try img_store.save(allocator, raw_img.data, file_id);
 
         return history.Entry{
-            .ts_unix = std.time.timestamp(),
+            .ts_unix = app_io.unixTimestamp(),
             .item = .{ .image = .{
                 .format = raw_img.format,
                 .file_id = file_id,
                 .raw_size = @intCast(raw_img.data.len),
+                .content_hash = history.hashImageData(raw_img.data),
             } },
         };
     }

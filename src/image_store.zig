@@ -1,4 +1,5 @@
 const std = @import("std");
+const app_io = @import("app_io.zig");
 const w = @import("win32.zig");
 
 var g_images_dir: []const u8 = "";
@@ -25,7 +26,7 @@ pub fn deinit(allocator: std.mem.Allocator) void {
 }
 
 pub fn nextFileId() i64 {
-    const ts = std.time.milliTimestamp();
+    const ts = app_io.milliTimestamp();
     g_next_file_id = @max(g_next_file_id + 1, ts);
     return g_next_file_id;
 }
@@ -56,17 +57,17 @@ pub fn save(allocator: std.mem.Allocator, raw_data: []const u8, file_id: i64) !u
     var name_buf: [80]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "{d}.lz", .{file_id}) catch return error.NameTooLong;
 
-    const cwd = std.fs.cwd();
-    var dir = cwd.openDir(g_images_dir, .{}) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    var dir = cwd.openDir(app_io.io, g_images_dir, .{}) catch |err| {
         // Try creating the directory first
-        cwd.makePath(g_images_dir) catch return err;
+        cwd.createDirPath(app_io.io, g_images_dir) catch return err;
         return save(allocator, raw_data, file_id); // retry once
     };
-    defer dir.close();
+    defer dir.close(app_io.io);
 
-    const file = try dir.createFile(name, .{ .truncate = true });
-    defer file.close();
-    try file.writeAll(comp_buf[0..final_size]);
+    const file = try dir.createFile(app_io.io, name, .{ .truncate = true });
+    defer file.close(app_io.io);
+    try file.writePositionalAll(app_io.io, comp_buf[0..final_size], 0);
 
     return final_size;
 }
@@ -76,15 +77,15 @@ pub fn load(allocator: std.mem.Allocator, file_id: i64, raw_size: u32) ![]u8 {
     var name_buf: [80]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "{d}.lz", .{file_id}) catch return error.NameTooLong;
 
-    var dir = try std.fs.cwd().openDir(g_images_dir, .{});
-    defer dir.close();
-    const file = try dir.openFile(name, .{});
-    defer file.close();
+    var dir = try std.Io.Dir.cwd().openDir(app_io.io, g_images_dir, .{});
+    defer dir.close(app_io.io);
+    const file = try dir.openFile(app_io.io, name, .{});
+    defer file.close(app_io.io);
 
-    const stat = try file.stat();
+    const stat = try file.stat(app_io.io);
     const comp_data = try allocator.alloc(u8, @intCast(stat.size));
     defer allocator.free(comp_data);
-    _ = try file.readAll(comp_data);
+    _ = try file.readPositionalAll(app_io.io, comp_data, 0);
 
     const result = try allocator.alloc(u8, raw_size);
     errdefer allocator.free(result);
@@ -111,7 +112,7 @@ pub fn delete(file_id: i64) void {
     var name_buf: [80]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "{d}.lz", .{file_id}) catch return;
 
-    var dir = std.fs.cwd().openDir(g_images_dir, .{}) catch return;
-    defer dir.close();
-    dir.deleteFile(name) catch {};
+    var dir = std.Io.Dir.cwd().openDir(app_io.io, g_images_dir, .{}) catch return;
+    defer dir.close(app_io.io);
+    dir.deleteFile(app_io.io, name) catch {};
 }

@@ -16,6 +16,11 @@ pub const ATOM = u16;
 pub const WCHAR = u16;
 pub const SIZE_T = usize;
 
+pub const FILETIME = extern struct {
+    dwLowDateTime: DWORD,
+    dwHighDateTime: DWORD,
+};
+
 pub const HANDLE = *anyopaque;
 pub const HWND = ?*anyopaque;
 pub const HINSTANCE = ?*anyopaque;
@@ -201,6 +206,8 @@ pub const INPUT = extern struct {
 };
 
 pub extern "kernel32" fn GetModuleHandleW(lpModuleName: LPCWSTR) callconv(WINAPI) HINSTANCE;
+pub extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *FILETIME) callconv(WINAPI) void;
+pub extern "kernel32" fn Sleep(dwMilliseconds: DWORD) callconv(WINAPI) void;
 pub extern "kernel32" fn GlobalLock(hMem: HGLOBAL) callconv(WINAPI) ?*anyopaque;
 pub extern "kernel32" fn GlobalUnlock(hMem: HGLOBAL) callconv(WINAPI) BOOL;
 pub extern "kernel32" fn GlobalSize(hMem: HGLOBAL) callconv(WINAPI) SIZE_T;
@@ -297,6 +304,9 @@ pub extern "gdi32" fn StretchDIBits(
     rop: DWORD,
 ) callconv(WINAPI) INT;
 pub extern "gdi32" fn SetBkMode(hdc: HDC, mode: INT) callconv(WINAPI) INT;
+pub extern "gdi32" fn SaveDC(hdc: HDC) callconv(WINAPI) INT;
+pub extern "gdi32" fn RestoreDC(hdc: HDC, nSavedDC: INT) callconv(WINAPI) BOOL;
+pub extern "gdi32" fn IntersectClipRect(hdc: HDC, left: INT, top: INT, right: INT, bottom: INT) callconv(WINAPI) INT;
 pub extern "gdi32" fn SetTextColor(hdc: HDC, color: COLORREF) callconv(WINAPI) COLORREF;
 pub extern "gdi32" fn TextOutW(hdc: HDC, x: INT, y: INT, lpString: [*]const WCHAR, c: INT) callconv(WINAPI) BOOL;
 pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(WINAPI) HBRUSH;

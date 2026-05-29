@@ -2,12 +2,12 @@
 
 Minimal Windows clipboard manager prototype focused on low overhead.
 
-## Current status (usable v1)
+## Current status (usable v0.1.2)
 - Hidden Win32 window + message loop
 - Clipboard listener via `WM_CLIPBOARDUPDATE`
 - Global hotkey to toggle picker window:
-  - tries `Win+V`
-  - falls back to `Ctrl+Shift+V` if `Win+V` is already registered by Windows/another app
+  - primary: `Win+V` (intercepts Windows clipboard history)
+  - backups: `Ctrl+Alt+B`, `F8`
 - Native picker window with keyboard controls:
   - Up/Down to select entry
   - Enter to paste selected entry

@@ -4,20 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build & Run
 
-Zig is installed via winget. It is NOT on PATH in Git Bash. Always use the full path:
+Requires Zig 0.16.0+ on Windows. If `zig` is not on PATH, use the installed Zig path or a downloaded 0.16.0+ compiler.
 
 ```bash
-export ZIG="/c/Users/valen/AppData/Local/Microsoft/WinGet/Packages/zig.zig_Microsoft.Winget.Source_8wekyb3d8bbwe/zig-x86_64-windows-0.15.2/zig.exe"
-"$ZIG" build                          # debug build
-"$ZIG" build -Doptimize=ReleaseSmall  # release build (smaller binary)
+zig build                          # debug build
+zig build -Doptimize=ReleaseSmall  # release build (smaller binary)
 ```
 
 The exe gets locked while running. Always kill before building:
 ```bash
-taskkill.exe //f //im lightboard.exe 2>/dev/null; "$ZIG" build
+taskkill.exe //f //im lightboard.exe 2>/dev/null; zig build
 ```
 
-Requires Zig 0.15.2+. Links libc. Targets Windows only (subsystem = .Windows).
+Links libc. Targets Windows only (subsystem = .Windows).
 
 Output binary: `zig-out/bin/lightboard.exe`
 
@@ -38,6 +37,39 @@ Never wait for the user to ask — do this automatically after every change.
 
 When making significant changes (new features, new files, architecture changes, new hotkeys, new dependencies), update this file to reflect them. Keep the Architecture and Key Patterns sections accurate so future sessions start productive immediately.
 
+## MANDATORY: Hotkeys Are Fixed
+
+See [AGENTS.md](AGENTS.md) for the canonical hotkey contract. Do not change Lightboard's hotkeys unless the user explicitly asks to change hotkeys.
+
+- `Win+V` is the primary hotkey and must stay primary.
+- `Ctrl+Alt+B` and `F8` are fallbacks only.
+- If `TextInputHost.exe` / Windows Input Experience comes back, fix the system disable or the `Win+V` hook. Do not "solve" it by removing `Win+V` or making the fallbacks primary.
+- If typing plain `v` opens Lightboard, the hook is wrong. Only swallow `VK_V` when `winKeyDown()` is physically true at keydown time; avoid persistent Win-key state that can get stuck after key-up.
+
+## TextInputHost Troubleshooting
+
+When Windows Input Experience appears instead of Lightboard, use this sequence:
+
+1. Verify Lightboard is running and the hook installed:
+   ```powershell
+   Get-Process lightboard
+   Get-Content .\lightboard-debug.log -Tail 30
+   ```
+   Look for `installed LL keyboard hook for Win+V` and `hotkey active: Win+V`.
+2. Press `Win+V` and check the log for `LL hook: Win+V intercepted` followed by `WM_APP: Win+V hook toggle`.
+3. If `TextInputHost.exe` respawns, run the dedicated script from elevated PowerShell:
+   ```powershell
+   cd C:\Users\valen\Documents\GitHub\windows-stuff
+   powershell -ExecutionPolicy Bypass -File .\Disable-TextInputHost.ps1
+   ```
+4. Undo, if needed:
+   ```powershell
+   cd C:\Users\valen\Documents\GitHub\windows-stuff
+   powershell -ExecutionPolicy Bypass -File .\Disable-TextInputHost.ps1 -Undo
+   ```
+
+The disable script uses IFEO, preload/task/package settings, kills the running process, and renames `TextInputHost.exe` to `.bak` because COM activation can bypass IFEO and respawn it. Regular keyboard typing is not affected; Windows emoji picker, native clipboard history, voice typing, and touch keyboard are affected.
+
 ## Architecture
 
 Lightboard is a Windows clipboard history manager written in pure Zig with no external dependencies. It uses raw Win32 API calls (no Zig std GUI abstractions). Also links ntdll for LZNT1 compression.
@@ -53,7 +85,7 @@ Lightboard is a Windows clipboard history manager written in pure Zig with no ex
 ### Key Patterns
 
 - **Two windows**: A hidden message-only window (`g_message_hwnd`) receives clipboard updates and hotkey messages. A visible picker window (`g_picker_hwnd`) displays history and handles user interaction.
-- **Hotkey cascade**: Tries multiple hotkey combos in order (Ctrl+Alt+B, Win+V, Ctrl+Shift+V, etc.) and registers the first one that succeeds. Also polls Ctrl+Alt+B and F8 as fallbacks via a 20ms timer.
+- **Hotkeys**: Installs a low-level keyboard hook so `Win+V` opens Lightboard instead of Windows clipboard history. Also registers/polls `Ctrl+Alt+B` and `F8` as fallback picker toggles.
 - **Self-trigger guard**: `g_ignore_clipboard_updates` counter prevents re-capturing items we just pasted.
 - **Target window tracking**: Continuously tracks the foreground window so paste can restore focus to the correct app after picker selection.
 - **Picker rendering**: Custom GDI paint in `paintPicker()` - dark theme, card-style layout, scrollbar, text wrapping, and DIB thumbnail rendering for images.

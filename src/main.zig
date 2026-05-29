@@ -1,5 +1,6 @@
 const std = @import("std");
 const w = @import("win32.zig");
+const app_io = @import("app_io.zig");
 const clip = @import("clipboard.zig");
 const history = @import("history.zig");
 const img_store = @import("image_store.zig");
@@ -7,6 +8,7 @@ const img_store = @import("image_store.zig");
 const MESSAGE_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_msg");
 const PICKER_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_picker");
 const WINDOW_NAME = std.unicode.utf8ToUtf16LeStringLiteral("lightboard");
+const APP_VERSION = "v0.1.2";
 const HOTKEY_ID: usize = 1;
 const HOTKEY_ID_F8: usize = 2;
 const TARGET_TRACK_TIMER_ID: usize = 1;
@@ -14,23 +16,35 @@ const TARGET_TRACK_INTERVAL_MS: w.UINT = 20;
 const TAB_Y: c_int = 8;
 const LIST_TOP: c_int = 32;
 const CARD_GAP: c_int = 4;
+const CARD_LEFT: c_int = 12;
+const CARD_RIGHT_MARGIN: c_int = 20;
+const CARD_MIN_W: c_int = 80;
 const TEXT_LINE_H: c_int = 20;
 const TEXT_PAD_V: c_int = 20; // 10 top + 10 bottom
+const TEXT_PAD_LEFT: c_int = 14;
+const TEXT_ACTION_GUTTER: c_int = 64;
+const TEXT_AVG_CHAR_W: c_int = 7;
+const MIN_TEXT_LINES: c_int = 2;
 const MAX_TEXT_LINES: usize = 5;
-const MAX_WRAP_CHARS: usize = 40;
-const IMAGE_CARD_H: c_int = 160;
+const MIN_WRAP_CHARS: usize = 12;
+const MAX_WRAP_CHARS: usize = 80;
+const IMAGE_SIDE_PAD: c_int = 12;
+const IMAGE_PAD_V: c_int = 16; // 8 top + 8 bottom
+const IMAGE_MAX_THUMB_H: c_int = 104;
+const IMAGE_MIN_CARD_H: c_int = 48;
+const IMAGE_FALLBACK_CARD_H: c_int = 96;
 const BOTTOM_MARGIN: c_int = 8;
+const WHEEL_SCROLL_PX: c_int = 48;
+const PAGE_SCROLL_OVERLAP_PX: c_int = 32;
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var gpa = std.heap.DebugAllocator(.{}){};
 var g_history = history.History.init(20);
 var g_message_hwnd: w.HWND = null;
 var g_picker_hwnd: w.HWND = null;
 var g_hotkey_label: []const u8 = "Win+V";
 var g_hotkey_registered = false;
-var g_selected_from_newest: usize = 0;
-var g_scroll_from_newest: usize = 0;
 var g_ignore_clipboard_updates: usize = 0;
-var g_log_file: ?std.fs.File = null;
+var g_log_file: ?std.Io.File = null;
 var g_f8_hotkey_registered = false;
 var g_last_target_hwnd: w.HWND = null;
 var g_ui_font: w.HFONT = null;
@@ -40,16 +54,51 @@ var g_prev_left_down = false;
 var g_timer_logged = false;
 var g_hotkey_debounce: i64 = 0; // timestamp of last toggle to prevent rapid re-toggle
 var g_kb_hook: w.HHOOK = null; // low-level keyboard hook for Win+V
-var g_win_key_down: bool = false; // tracking Win key state for the hook
+var g_win_v_intercept_active = false;
+
+fn winKeyDown() bool {
+    const l = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_LWIN)));
+    const r = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_RWIN)));
+    return l or r;
+}
 
 const ActiveTab = enum { history, pinned };
-var g_active_tab: ActiveTab = .history;
+const ViewState = struct {
+    selected_from_newest: usize = 0,
+    scroll_px: c_int = 0,
+};
 
-pub fn main() !void {
+var g_active_tab: ActiveTab = .history;
+var g_history_view: ViewState = .{};
+var g_pinned_view: ViewState = .{};
+
+fn activeView() *ViewState {
+    return switch (g_active_tab) {
+        .history => &g_history_view,
+        .pinned => &g_pinned_view,
+    };
+}
+
+fn resetView(view: *ViewState) void {
+    view.* = .{};
+}
+
+fn resetActiveView() void {
+    resetView(activeView());
+}
+
+fn switchActiveTab(tab: ActiveTab) void {
+    g_active_tab = tab;
+    clampActiveView();
+    _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+}
+
+pub fn main(init: std.process.Init) !void {
+    app_io.init(init.io);
     initDebugLog();
     defer {
         dbgLog("lightboard shutting down", .{});
-        if (g_log_file) |f| f.close();
+        if (g_log_file) |f| f.close(app_io.io);
 
         const leaked = gpa.deinit();
         if (leaked == .leak) {
@@ -121,7 +170,6 @@ pub fn main() !void {
         null,
     ) orelse return error.CreateWindowFailed;
     _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
-    removeCloseButton(g_picker_hwnd);
     applyWindowTheme(g_picker_hwnd);
 
     g_ui_font = w.CreateFontW(
@@ -153,23 +201,14 @@ pub fn main() !void {
     _ = w.SetTimer(g_message_hwnd, TARGET_TRACK_TIMER_ID, TARGET_TRACK_INTERVAL_MS, null);
     defer _ = w.KillTimer(g_message_hwnd, TARGET_TRACK_TIMER_ID);
 
-    // Try low-level keyboard hook for Win+V first (bypasses Windows shell reservation)
     const winv_hooked = installWinVHook();
     defer {
         if (g_kb_hook != null) _ = w.UnhookWindowsHookEx(g_kb_hook);
     }
-    if (winv_hooked) {
-        g_hotkey_label = "Win+V";
-        g_hotkey_registered = true;
-        std.log.info("lightboard running (Win+V opens picker via LL hook)", .{});
-        dbgLog("hotkey active: Win+V (LL hook)", .{});
-    } else if (registerHotkey()) {
+
+    const fallback_hotkey_registered = registerHotkey();
+    if (fallback_hotkey_registered) {
         defer _ = w.UnregisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID));
-        std.log.info("lightboard running ({s} opens picker)", .{g_hotkey_label});
-        dbgLog("hotkey active: {s}", .{g_hotkey_label});
-    } else {
-        std.log.warn("lightboard running with no hotkey (all candidates unavailable)", .{});
-        dbgLog("no hotkey available", .{});
     }
 
     g_f8_hotkey_registered = w.RegisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID_F8), 0, w.VK_F8) != 0;
@@ -178,6 +217,22 @@ pub fn main() !void {
         dbgLog("registered backup hotkey: F8", .{});
     } else {
         dbgLog("failed backup hotkey F8 winerr={d}", .{w.GetLastError()});
+    }
+
+    if (winv_hooked) {
+        g_hotkey_label = "Win+V";
+        g_hotkey_registered = true;
+        std.log.info("lightboard running (Win+V opens picker)", .{});
+        dbgLog("hotkey active: Win+V (LL hook), fallback Ctrl+Alt+B={}, F8={}", .{ fallback_hotkey_registered, g_f8_hotkey_registered });
+    } else if (fallback_hotkey_registered) {
+        std.log.warn("lightboard running (Win+V hook unavailable; Ctrl+Alt+B opens picker)", .{});
+        dbgLog("hotkey active: Ctrl+Alt+B fallback, F8={}", .{g_f8_hotkey_registered});
+    } else if (g_f8_hotkey_registered) {
+        std.log.warn("lightboard running (Win+V/Ctrl+Alt+B unavailable; F8 opens picker)", .{});
+        dbgLog("hotkey active: F8 backup only", .{});
+    } else {
+        std.log.warn("lightboard running with no registered hotkey", .{});
+        dbgLog("no registered hotkey available", .{});
     }
 
     var msg: w.MSG = .{};
@@ -194,8 +249,8 @@ pub fn main() !void {
         }
         if (msg.message == w.WM_MOUSEWHEEL and g_picker_hwnd != null and w.IsWindowVisible(g_picker_hwnd) != 0) {
             const delta = getWheelDelta(msg.wParam);
-            const steps: i32 = @intCast(@max(@as(u32, 1), @divTrunc(@as(u32, @intCast(@abs(@as(i32, delta)))), @as(u32, 120))));
-            if (delta > 0) scrollBy(-steps) else if (delta < 0) scrollBy(steps);
+            const steps: c_int = @intCast(@max(@as(u32, 1), @divTrunc(@as(u32, @intCast(@abs(@as(i32, delta)))), @as(u32, 120))));
+            if (delta > 0) scrollByPixels(-(steps * WHEEL_SCROLL_PX)) else if (delta < 0) scrollByPixels(steps * WHEEL_SCROLL_PX);
             dbgLog("wheel scroll(loop) delta={d}", .{delta});
             continue;
         }
@@ -208,32 +263,20 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
     if (nCode == w.HC_ACTION) {
         const kb: *const w.KBDLLHOOKSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
         const msg = @as(w.UINT, @intCast(wParam));
+        const is_keydown = (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN);
+        const is_keyup = (msg == w.WM_KEYUP_LL or msg == w.WM_SYSKEYUP);
 
-        // Track Win key state (with GetAsyncKeyState cross-check to prevent stuck state)
-        if (kb.vkCode == w.VK_LWIN or kb.vkCode == w.VK_RWIN) {
-            if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
-                g_win_key_down = true;
-            } else if (msg == w.WM_KEYUP_LL or msg == w.WM_SYSKEYUP) {
-                g_win_key_down = false;
-            }
-        }
+        const win_down = winKeyDown();
+        if (kb.vkCode == w.VK_V) {
+            if (is_keydown) {
+                if (!win_down) {
+                    g_win_v_intercept_active = false;
+                    return w.CallNextHookEx(g_kb_hook, nCode, wParam, lParam);
+                }
 
-        // Cross-check: if we think Win is down but it's physically up, fix the flag.
-        // This prevents g_win_key_down getting stuck true when a key-up event is missed.
-        if (g_win_key_down) {
-            const lwin_real = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_LWIN)));
-            const rwin_real = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_RWIN)));
-            if (!lwin_real and !rwin_real) {
-                g_win_key_down = false;
-            }
-        }
+                g_win_v_intercept_active = true;
 
-        // Intercept Win+V: swallow both keydown and keyup of V while Win is held
-        if (kb.vkCode == w.VK_V and g_win_key_down) {
-            if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
-                // Inject Shift press+release to cancel Start menu detection.
-                // The shell won't open Start if any non-Win key was pressed
-                // during the Win hold. Shift is completely inert with Win alone.
+                // Prevent the Start menu from opening when Win is released.
                 var dummy = [2]w.INPUT{
                     .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{ .wVk = w.VK_LSHIFT } } },
                     .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{ .wVk = w.VK_LSHIFT, .dwFlags = w.KEYEVENTF_KEYUP } } },
@@ -242,13 +285,16 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
 
                 _ = w.PostMessageW(g_message_hwnd, w.WM_APP, 0, 0);
                 dbgLog("LL hook: Win+V intercepted, posting WM_APP", .{});
+                return 1;
             }
-            return 1; // swallow the keystroke
+
+            if (is_keyup and g_win_v_intercept_active) {
+                g_win_v_intercept_active = false;
+                return 1;
+            }
         }
 
-        // While Win is held and picker is visible, intercept navigation keys
-        // so the shell doesn't process them as Win+Arrow/etc.
-        if (g_win_key_down and g_picker_hwnd != null and w.IsWindowVisible(g_picker_hwnd) != 0) {
+        if (g_picker_hwnd != null and w.IsWindowVisible(g_picker_hwnd) != 0 and win_down) {
             const vk = @as(w.UINT, @intCast(kb.vkCode));
             const is_nav = (vk == w.VK_UP or vk == w.VK_DOWN or
                 vk == w.VK_J or vk == w.VK_K or
@@ -256,10 +302,10 @@ fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.W
                 vk == w.VK_PRIOR or vk == w.VK_NEXT or
                 vk == w.VK_DELETE or vk == w.VK_X or vk == w.VK_S);
             if (is_nav) {
-                if (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN) {
+                if (is_keydown) {
                     _ = w.PostMessageW(g_picker_hwnd, w.WM_KEYDOWN, vk, 0);
                 }
-                return 1; // swallow so shell doesn't get Win+Arrow etc.
+                return 1;
             }
         }
     }
@@ -278,27 +324,18 @@ fn installWinVHook() bool {
 }
 
 fn registerHotkey() bool {
-    const candidates = [_]struct {
-        mods: w.UINT,
-        vk: w.UINT,
-        label: []const u8,
-    }{
-        .{ .mods = w.MOD_CONTROL | w.MOD_ALT, .vk = w.VK_B, .label = "Ctrl+Alt+B" },
-        .{ .mods = w.MOD_CONTROL | w.MOD_SHIFT, .vk = w.VK_V, .label = "Ctrl+Shift+V" },
-        .{ .mods = w.MOD_CONTROL | w.MOD_ALT, .vk = w.VK_V, .label = "Ctrl+Alt+V" },
-        .{ .mods = w.MOD_ALT, .vk = w.VK_V, .label = "Alt+V" },
-    };
+    const mods = w.MOD_CONTROL | w.MOD_ALT;
+    const vk = w.VK_B;
+    const label = "Ctrl+Alt+B";
 
-    for (candidates) |candidate| {
-        dbgLog("trying hotkey: {s}", .{candidate.label});
-        if (w.RegisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID), candidate.mods, candidate.vk) != 0) {
-            g_hotkey_label = candidate.label;
-            g_hotkey_registered = true;
-            dbgLog("registered hotkey: {s}", .{candidate.label});
-            return true;
-        }
-        dbgLog("failed hotkey: {s} winerr={d}", .{ candidate.label, w.GetLastError() });
+    dbgLog("trying hotkey: {s}", .{label});
+    if (w.RegisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID), mods, vk) != 0) {
+        g_hotkey_label = label;
+        g_hotkey_registered = true;
+        dbgLog("registered hotkey: {s}", .{label});
+        return true;
     }
+    dbgLog("failed hotkey: {s} winerr={d}", .{ label, w.GetLastError() });
 
     g_hotkey_registered = false;
     g_hotkey_label = "None";
@@ -308,9 +345,8 @@ fn registerHotkey() bool {
 fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callconv(w.WINAPI) w.LRESULT {
     switch (msg) {
         w.WM_APP => {
-            // Win+V intercepted by low-level keyboard hook
             dbgLog("WM_APP: Win+V hook toggle", .{});
-            const now = std.time.milliTimestamp();
+            const now = app_io.milliTimestamp();
             if (now - g_hotkey_debounce >= 300) {
                 g_hotkey_debounce = now;
                 togglePicker();
@@ -318,9 +354,16 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
             return 0;
         },
         w.WM_HOTKEY => {
-            // WM_HOTKEY delivery is unreliable on some systems; polling handles it.
-            // Just log if we ever receive one (for diagnostics).
-            dbgLog("WM_HOTKEY received id={d} (ignored, poll handles it)", .{wparam});
+            if (wparam == HOTKEY_ID or wparam == HOTKEY_ID_F8) {
+                const now = app_io.milliTimestamp();
+                if (now - g_hotkey_debounce >= 300) {
+                    g_hotkey_debounce = now;
+                    dbgLog("WM_HOTKEY toggle id={d}", .{wparam});
+                    togglePicker();
+                }
+            } else {
+                dbgLog("WM_HOTKEY unknown id={d}", .{wparam});
+            }
             return 0;
         },
         w.WM_CLIPBOARDUPDATE => {
@@ -366,30 +409,24 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
                 // Tab bar click detection
                 if (click_y >= TAB_Y and click_y < LIST_TOP) {
                     if (click_x >= 16 and click_x < 80) {
-                        g_active_tab = .history;
-                        g_selected_from_newest = 0;
-                        g_scroll_from_newest = 0;
-                        _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+                        switchActiveTab(.history);
                     } else if (click_x >= 80 and click_x < 150) {
-                        g_active_tab = .pinned;
-                        g_selected_from_newest = 0;
-                        g_scroll_from_newest = 0;
-                        _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+                        switchActiveTab(.pinned);
                     }
                     return 0;
                 }
                 if (hitTestClick(click_x, click_y)) |hit| {
                     switch (hit.zone) {
                         .delete => {
-                            g_selected_from_newest = hit.from_newest;
+                            activeView().selected_from_newest = hit.from_newest;
                             deleteSelected();
                         },
                         .pin => {
-                            g_selected_from_newest = hit.from_newest;
+                            activeView().selected_from_newest = hit.from_newest;
                             toggleSticky();
                         },
                         .body => {
-                            g_selected_from_newest = hit.from_newest;
+                            activeView().selected_from_newest = hit.from_newest;
                             ensureSelectionVisible();
                             _ = w.InvalidateRect(g_picker_hwnd, null, 1);
                             pasteSelection();
@@ -402,8 +439,8 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
         w.WM_MOUSEWHEEL => {
             if (g_picker_hwnd != null and w.IsWindowVisible(g_picker_hwnd) != 0) {
                 const delta = getWheelDelta(wparam);
-                const steps: i32 = @intCast(@max(@as(u32, 1), @divTrunc(@as(u32, @intCast(@abs(@as(i32, delta)))), @as(u32, 120))));
-                if (delta > 0) scrollBy(-steps) else if (delta < 0) scrollBy(steps);
+                const steps: c_int = @intCast(@max(@as(u32, 1), @divTrunc(@as(u32, @intCast(@abs(@as(i32, delta)))), @as(u32, 120))));
+                if (delta > 0) scrollByPixels(-(steps * WHEEL_SCROLL_PX)) else if (delta < 0) scrollByPixels(steps * WHEEL_SCROLL_PX);
                 dbgLog("wheel scroll(proc) delta={d}", .{delta});
                 return 0;
             }
@@ -486,8 +523,7 @@ fn togglePicker() void {
     }
 
     rememberTargetWindow();
-    g_selected_from_newest = 0;
-    g_scroll_from_newest = 0;
+    resetActiveView();
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     _ = w.ShowWindow(g_picker_hwnd, w.SW_SHOW);
     forceForeground(g_picker_hwnd);
@@ -545,10 +581,10 @@ fn handlePickerKey(key: w.UINT) void {
             }
         },
         w.VK_PRIOR => {
-            scrollBy(-4);
+            scrollByPixels(-pageScrollAmount());
         },
         w.VK_NEXT => {
-            scrollBy(4);
+            scrollByPixels(pageScrollAmount());
         },
         w.VK_DELETE => {
             if (ctrl_held) {
@@ -566,10 +602,7 @@ fn handlePickerKey(key: w.UINT) void {
             toggleSticky();
         },
         w.VK_TAB => {
-            g_active_tab = if (g_active_tab == .history) .pinned else .history;
-            g_selected_from_newest = 0;
-            g_scroll_from_newest = 0;
-            _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+            switchActiveTab(if (g_active_tab == .history) .pinned else .history);
             dbgLog("tab switched to {s}", .{if (g_active_tab == .history) "history" else "pinned"});
         },
         else => {},
@@ -586,13 +619,14 @@ fn moveSelection(delta: i32) void {
     const len = filteredCount();
     if (len == 0) return;
 
-    var next = @as(i32, @intCast(g_selected_from_newest)) + delta;
+    const view = activeView();
+    var next = @as(i32, @intCast(view.selected_from_newest)) + delta;
     if (next < 0) next = 0;
 
     const max_idx: i32 = @intCast(len - 1);
     if (next > max_idx) next = max_idx;
 
-    g_selected_from_newest = @intCast(next);
+    view.selected_from_newest = @intCast(next);
     ensureSelectionVisible();
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
 }
@@ -600,8 +634,10 @@ fn moveSelection(delta: i32) void {
 fn pasteSelection() void {
     const flen = filteredCount();
     if (flen == 0) return;
+    clampActiveView();
+    const view = activeView();
 
-    const from_newest = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
+    const from_newest = if (view.selected_from_newest < flen) view.selected_from_newest else flen - 1;
     const result = filteredEntry(from_newest) orelse return;
     const selected = result.entry;
 
@@ -619,7 +655,7 @@ fn pasteSelection() void {
     if (target != null and target != g_picker_hwnd) {
         _ = w.SetForegroundWindow(target);
         // Give Windows time to complete foreground handoff before synthetic keys.
-        std.Thread.sleep(140 * std.time.ns_per_ms);
+        w.Sleep(140);
     } else {
         dbgLog("no previous target window available for focus restore", .{});
     }
@@ -630,8 +666,10 @@ fn pasteSelection() void {
 fn openSelectedImage() void {
     const flen = filteredCount();
     if (flen == 0) return;
+    clampActiveView();
+    const view = activeView();
 
-    const from_newest = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
+    const from_newest = if (view.selected_from_newest < flen) view.selected_from_newest else flen - 1;
     const result = filteredEntry(from_newest) orelse return;
     const selected = result.entry;
 
@@ -670,7 +708,8 @@ fn openSelectedImage() void {
     std.mem.writeInt(u32, header[10..14], pixel_offset, .little);
 
     // Write to %LOCALAPPDATA%\lightboard\preview.bmp
-    const local_app_data = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch {
+    const env: std.process.Environ = .{ .block = .global };
+    const local_app_data = env.getAlloc(allocator, "LOCALAPPDATA") catch {
         dbgLog("LOCALAPPDATA not found, can't open image", .{});
         return;
     };
@@ -679,14 +718,14 @@ fn openSelectedImage() void {
     const bmp_path = std.fs.path.joinZ(allocator, &.{ local_app_data, "lightboard", "preview.bmp" }) catch return;
     defer allocator.free(bmp_path);
 
-    const file = std.fs.cwd().createFileZ(bmp_path, .{}) catch |err| {
+    const file = std.Io.Dir.createFileAbsolute(app_io.io, bmp_path, .{}) catch |err| {
         dbgLog("failed to create preview.bmp: {s}", .{@errorName(err)});
         return;
     };
-    defer file.close();
+    defer file.close(app_io.io);
 
-    file.writeAll(&header) catch return;
-    file.writeAll(raw_data) catch return;
+    file.writePositionalAll(app_io.io, &header, 0) catch return;
+    file.writePositionalAll(app_io.io, raw_data, header.len) catch return;
 
     dbgLog("wrote preview.bmp, opening with shell", .{});
 
@@ -715,27 +754,16 @@ fn deleteSelected() void {
     const allocator = gpa.allocator();
     const flen = filteredCount();
     if (flen == 0) return;
+    clampActiveView();
+    const view = activeView();
 
-    const from_newest = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
+    const from_newest = if (view.selected_from_newest < flen) view.selected_from_newest else flen - 1;
     const r = filteredEntry(from_newest) orelse return;
 
     g_history.removeAt(allocator, r.real_idx);
     dbgLog("deleted entry idx={d} from_newest={d}", .{ r.real_idx, from_newest });
 
-    // Adjust selection: keep same position, but clamp to new filtered bounds
-    const new_flen = filteredCount();
-    if (new_flen == 0) {
-        g_selected_from_newest = 0;
-        g_scroll_from_newest = 0;
-    } else {
-        if (g_selected_from_newest >= new_flen) {
-            g_selected_from_newest = new_flen - 1;
-        }
-        if (g_scroll_from_newest >= new_flen) {
-            g_scroll_from_newest = if (new_flen > 0) new_flen - 1 else 0;
-        }
-    }
-
+    clampActiveView();
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     persistHistory();
 }
@@ -743,8 +771,7 @@ fn deleteSelected() void {
 fn deleteAllNonSticky() void {
     const allocator = gpa.allocator();
     g_history.clearNonSticky(allocator);
-    g_selected_from_newest = 0;
-    g_scroll_from_newest = 0;
+    resetView(&g_history_view);
     dbgLog("deleted all non-sticky entries, remaining={d}", .{g_history.len()});
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     persistHistory();
@@ -753,27 +780,17 @@ fn deleteAllNonSticky() void {
 fn toggleSticky() void {
     const flen = filteredCount();
     if (flen == 0) return;
+    clampActiveView();
+    const view = activeView();
 
-    const from_newest = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
+    const from_newest = if (view.selected_from_newest < flen) view.selected_from_newest else flen - 1;
     const r = filteredEntry(from_newest) orelse return;
 
     g_history.entries.items[r.real_idx].sticky = !g_history.entries.items[r.real_idx].sticky;
     dbgLog("toggled sticky idx={d} now={}", .{ r.real_idx, g_history.entries.items[r.real_idx].sticky });
 
-    // Entry moved to the other tab — clamp selection
-    const new_flen = filteredCount();
-    if (new_flen == 0) {
-        g_selected_from_newest = 0;
-        g_scroll_from_newest = 0;
-    } else {
-        if (g_selected_from_newest >= new_flen) {
-            g_selected_from_newest = new_flen - 1;
-        }
-        if (g_scroll_from_newest >= new_flen) {
-            g_scroll_from_newest = if (new_flen > 0) new_flen - 1 else 0;
-        }
-    }
-
+    // Entry moved to the other tab — clamp the active tab without losing the other tab's scroll state.
+    clampActiveView();
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     persistHistory();
 }
@@ -855,54 +872,76 @@ fn paintPicker(hwnd: w.HWND) void {
         _ = w.SetTextColor(hdc, color_text_sub);
         const empty_msg = if (g_active_tab == .history) "Clipboard history is empty" else "No pinned entries";
         drawUtf8Line(hdc, 16, LIST_TOP + 12, empty_msg);
+        drawVersion(hdc, rect, color_text_sub);
         return;
     }
 
-    const selected = if (g_selected_from_newest < flen) g_selected_from_newest else flen - 1;
     const client_h = rect.bottom - rect.top;
-    const start_from_newest = g_scroll_from_newest;
+    const card_w = cardWidthFromClientRect(rect);
+    clampActiveViewWithMetrics(card_w, client_h);
+    const view = activeView();
+    const selected = if (view.selected_from_newest < flen) view.selected_from_newest else flen - 1;
+    const viewport_h = listViewportHeight(client_h);
+    const list_bottom = LIST_TOP + viewport_h;
 
-    var y: c_int = LIST_TOP;
+    const saved_dc = w.SaveDC(hdc);
+    if (saved_dc != 0) _ = w.IntersectClipRect(hdc, 0, LIST_TOP, rect.right, list_bottom);
+    defer {
+        if (saved_dc != 0) _ = w.RestoreDC(hdc, saved_dc);
+    }
+
+    var item_top: c_int = 0;
     var visible_count: usize = 0;
-    var i: usize = start_from_newest;
+    var i: usize = 0;
     while (i < flen) : (i += 1) {
         const result = filteredEntry(i) orelse break;
         const entry = result.entry;
-        const card_h = entryCardHeight(entry);
-        if (y + card_h > client_h - BOTTOM_MARGIN and visible_count > 0) break;
+        const card_h = entryCardHeight(entry, card_w);
+        const item_bottom = item_top + card_h;
 
-        const is_selected = i == selected;
+        if (item_bottom >= view.scroll_px and item_top <= view.scroll_px + viewport_h) {
+            const y = LIST_TOP + item_top - view.scroll_px;
+            const is_selected = i == selected;
 
-        const row_rect = w.RECT{ .left = 12, .top = y, .right = rect.right - 20, .bottom = y + card_h };
-        const row_brush = w.CreateSolidBrush(if (is_selected) color_card_selected else color_card);
-        if (row_brush != null) {
-            _ = w.FillRect(hdc, &row_rect, row_brush);
-            _ = w.DeleteObject(row_brush);
-        }
-
-        if (is_selected) {
-            const bar_h: c_int = @min(20, card_h - 8);
-            const bar_top = y + @divTrunc(card_h - bar_h, 2);
-            const accent_rect = w.RECT{ .left = 12, .top = bar_top, .right = 15, .bottom = bar_top + bar_h };
-            const accent_brush = w.CreateSolidBrush(color_accent);
-            if (accent_brush != null) {
-                _ = w.FillRect(hdc, &accent_rect, accent_brush);
-                _ = w.DeleteObject(accent_brush);
+            const row_rect = w.RECT{ .left = CARD_LEFT, .top = y, .right = CARD_LEFT + card_w, .bottom = y + card_h };
+            const row_brush = w.CreateSolidBrush(if (is_selected) color_card_selected else color_card);
+            if (row_brush != null) {
+                _ = w.FillRect(hdc, &row_rect, row_brush);
+                _ = w.DeleteObject(row_brush);
             }
+
+            if (is_selected) {
+                const bar_h: c_int = @min(20, card_h - 8);
+                const bar_top = y + @divTrunc(card_h - bar_h, 2);
+                const accent_rect = w.RECT{ .left = CARD_LEFT, .top = bar_top, .right = CARD_LEFT + 3, .bottom = bar_top + bar_h };
+                const accent_brush = w.CreateSolidBrush(color_accent);
+                if (accent_brush != null) {
+                    _ = w.FillRect(hdc, &accent_rect, accent_brush);
+                    _ = w.DeleteObject(accent_brush);
+                }
+            }
+
+            renderEntryLine(hdc, row_rect, entry, color_text_main, color_text_sub, color_accent);
+            visible_count += 1;
         }
 
-        renderEntryLine(hdc, row_rect, entry, color_text_main, color_text_sub, color_accent);
-        y += card_h + CARD_GAP;
-        visible_count += 1;
+        item_top += card_h + CARD_GAP;
+        if (item_top > view.scroll_px + viewport_h) break;
     }
 
     if (visible_count > 0) {
-        drawScrollbar(hdc, rect, flen, start_from_newest, visible_count);
+        drawScrollbar(hdc, rect, totalContentHeight(card_w), view.scroll_px, viewport_h);
     }
+    drawVersion(hdc, rect, color_text_sub);
+}
+
+fn drawVersion(hdc: w.HDC, rect: w.RECT, color_text_sub: w.COLORREF) void {
+    _ = w.SetTextColor(hdc, color_text_sub);
+    drawUtf8Line(hdc, rect.right - 54, rect.bottom - 22, APP_VERSION);
 }
 
 fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_main: w.COLORREF, color_text_sub: w.COLORREF, color_accent: w.COLORREF) void {
-    const text_x = rect.left + 14;
+    const text_x = rect.left + TEXT_PAD_LEFT;
     const text_y = rect.top + 10;
     const color_icon_dim = w.RGB(100, 100, 100);
 
@@ -924,22 +963,22 @@ fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_ma
         .text => |text| {
             _ = w.SetTextColor(hdc, color_text_main);
             var lines: [MAX_TEXT_LINES][120]u8 = [_][120]u8{[_]u8{0} ** 120} ** MAX_TEXT_LINES;
-            const lens = wrapTextIntoLines(text, &lines, MAX_TEXT_LINES, MAX_WRAP_CHARS);
+            const wrap_chars = textWrapCharsForCardWidth(rect.right - rect.left);
+            const wrapped = wrapTextIntoLines(text, &lines, wrap_chars);
             var li: usize = 0;
-            while (li < lens.len) : (li += 1) {
-                if (lens[li] == 0) break;
-                drawUtf8Line(hdc, text_x, text_y + @as(c_int, @intCast(li)) * TEXT_LINE_H, lines[li][0..lens[li]]);
+            while (li < wrapped.line_count) : (li += 1) {
+                drawUtf8Line(hdc, text_x, text_y + @as(c_int, @intCast(li)) * TEXT_LINE_H, lines[li][0..wrapped.lengths[li]]);
             }
         },
         .image => |img| {
             const thumb_rect = w.RECT{
-                .left = rect.left + 12,
+                .left = rect.left + IMAGE_SIDE_PAD,
                 .top = rect.top + 8,
-                .right = rect.right - 12,
+                .right = rect.right - IMAGE_SIDE_PAD,
                 .bottom = rect.bottom - 8,
             };
             const raw_data = img_store.load(gpa.allocator(), img.file_id, img.raw_size) catch {
-                drawUtf8Line(hdc, rect.left + 12, rect.top + 8, "[image load failed]");
+                drawUtf8Line(hdc, rect.left + IMAGE_SIDE_PAD, rect.top + 8, "[image load failed]");
                 return;
             };
             defer gpa.allocator().free(raw_data);
@@ -970,43 +1009,138 @@ fn sanitizeAndClipInto(dst: []u8, src: []const u8, max_chars: usize) usize {
     return max_chars;
 }
 
-fn wrapTextIntoLines(src: []const u8, lines: anytype, max_lines: usize, max_chars: usize) []usize {
-    var lengths: [8]usize = [_]usize{0} ** 8;
+fn textWrapCharsForCardWidth(card_width: c_int) usize {
+    const content_w = card_width - TEXT_PAD_LEFT - TEXT_ACTION_GUTTER;
+    var chars: usize = MIN_WRAP_CHARS;
+    if (content_w > 0) {
+        chars = @intCast(@divTrunc(content_w, TEXT_AVG_CHAR_W));
+    }
+    if (chars < MIN_WRAP_CHARS) return MIN_WRAP_CHARS;
+    if (chars > MAX_WRAP_CHARS) return MAX_WRAP_CHARS;
+    return chars;
+}
+
+const TextWrapResult = struct {
+    lengths: [MAX_TEXT_LINES]usize = [_]usize{0} ** MAX_TEXT_LINES,
+    line_count: usize = 0,
+};
+
+fn utf8BoundaryBefore(text: []const u8, start: usize, end_in: usize) usize {
+    var end = end_in;
+    while (end > start and end < text.len and (text[end] & 0xC0) == 0x80) : (end -= 1) {}
+    return end;
+}
+
+fn wrapTextIntoLines(src: []const u8, lines: *[MAX_TEXT_LINES][120]u8, max_chars: usize) TextWrapResult {
+    var result: TextWrapResult = .{};
     var sanitized: [512]u8 = undefined;
     const n = sanitizeInto(&sanitized, src);
     const text = sanitized[0..n];
 
     var line_idx: usize = 0;
     var i: usize = 0;
-    while (i < text.len and line_idx < max_lines) {
+    while (i < text.len and line_idx < MAX_TEXT_LINES) {
         while (i < text.len and text[i] == ' ') : (i += 1) {}
         if (i >= text.len) break;
 
-        var end = @min(i + max_chars, text.len);
+        const hard_end = @min(i + max_chars, text.len);
+        var end = hard_end;
         if (end < text.len) {
             var j = end;
             while (j > i and text[j - 1] != ' ') : (j -= 1) {}
             if (j > i) end = j - 1;
         }
+        end = utf8BoundaryBefore(text, i, end);
+        if (end <= i) end = utf8BoundaryBefore(text, i, hard_end);
+        if (end <= i) end = hard_end;
 
         const slice = text[i..end];
-        const copy_len = @min(slice.len, lines[line_idx].len - 1);
-        @memcpy(lines[line_idx][0..copy_len], slice[0..copy_len]);
-        lengths[line_idx] = copy_len;
+        const copy_len = @min(slice.len, lines.*[line_idx].len - 1);
+        @memcpy(lines.*[line_idx][0..copy_len], slice[0..copy_len]);
+        result.lengths[line_idx] = copy_len;
         line_idx += 1;
 
         i = end;
         while (i < text.len and text[i] == ' ') : (i += 1) {}
     }
 
-    if (i < text.len and line_idx == max_lines and lengths[max_lines - 1] >= 3) {
-        const last = max_lines - 1;
-        lines[last][lengths[last] - 3] = '.';
-        lines[last][lengths[last] - 2] = '.';
-        lines[last][lengths[last] - 1] = '.';
+    result.line_count = line_idx;
+    if (i < text.len and result.line_count == MAX_TEXT_LINES and result.lengths[MAX_TEXT_LINES - 1] >= 3) {
+        const last = MAX_TEXT_LINES - 1;
+        lines.*[last][result.lengths[last] - 3] = '.';
+        lines.*[last][result.lengths[last] - 2] = '.';
+        lines.*[last][result.lengths[last] - 1] = '.';
     }
 
-    return lengths[0..max_lines];
+    return result;
+}
+
+const ImageSize = struct { width: c_int, height: c_int };
+
+fn dibImageSize(data: []const u8) ?ImageSize {
+    if (data.len < 12) return null;
+
+    const header_size = std.mem.readInt(u32, data[0..4], .little);
+    const header_size_usize: usize = @intCast(header_size);
+    if (header_size_usize < @sizeOf(w.BITMAPINFOHEADER) or header_size_usize > data.len) return null;
+
+    const raw_w = std.mem.readInt(i32, data[4..8], .little);
+    const raw_h = std.mem.readInt(i32, data[8..12], .little);
+    if (raw_w == 0 or raw_h == 0) return null;
+
+    const width_i64 = if (raw_w < 0) -@as(i64, raw_w) else @as(i64, raw_w);
+    const height_i64 = if (raw_h < 0) -@as(i64, raw_h) else @as(i64, raw_h);
+    if (width_i64 <= 0 or height_i64 <= 0) return null;
+    if (width_i64 > std.math.maxInt(c_int) or height_i64 > std.math.maxInt(c_int)) return null;
+
+    return .{ .width = @intCast(width_i64), .height = @intCast(height_i64) };
+}
+
+fn imageSizeFromDisk(img: history.ImageMeta) ?ImageSize {
+    const raw_data = img_store.load(gpa.allocator(), img.file_id, img.raw_size) catch return null;
+    defer gpa.allocator().free(raw_data);
+    return dibImageSize(raw_data);
+}
+
+fn scaledDim(limit: c_int, value: c_int, denom: c_int) c_int {
+    if (limit <= 0 or value <= 0 or denom <= 0) return 1;
+    var out: c_int = @intCast(@divTrunc(@as(i64, limit) * @as(i64, value), @as(i64, denom)));
+    if (out < 1) out = 1;
+    return out;
+}
+
+fn fitImageNoUpscale(src_w: c_int, src_h: c_int, box_w: c_int, box_h: c_int) ImageSize {
+    if (src_w <= 0 or src_h <= 0 or box_w <= 0 or box_h <= 0) return .{ .width = 1, .height = 1 };
+
+    var dst_w = src_w;
+    var dst_h = src_h;
+
+    if (dst_w > box_w) {
+        dst_h = scaledDim(box_w, dst_h, dst_w);
+        dst_w = box_w;
+    }
+    if (dst_h > box_h) {
+        dst_w = scaledDim(box_h, dst_w, dst_h);
+        dst_h = box_h;
+    }
+
+    if (dst_w < 1) dst_w = 1;
+    if (dst_h < 1) dst_h = 1;
+    return .{ .width = dst_w, .height = dst_h };
+}
+
+fn imageThumbBoxWidth(card_width: c_int) c_int {
+    var box_w = card_width - (IMAGE_SIDE_PAD * 2);
+    if (box_w < 1) box_w = 1;
+    return box_w;
+}
+
+fn imageCardHeight(img: history.ImageMeta, card_width: c_int) c_int {
+    const size = imageSizeFromDisk(img) orelse return IMAGE_FALLBACK_CARD_H;
+    const fit = fitImageNoUpscale(size.width, size.height, imageThumbBoxWidth(card_width), IMAGE_MAX_THUMB_H);
+    var card_h = fit.height + IMAGE_PAD_V;
+    if (card_h < IMAGE_MIN_CARD_H) card_h = IMAGE_MIN_CARD_H;
+    return card_h;
 }
 
 fn drawImageThumbnail(hdc: w.HDC, rect: w.RECT, data: []const u8) void {
@@ -1032,32 +1166,17 @@ fn drawImageThumbnail(hdc: w.HDC, rect: w.RECT, data: []const u8) void {
     const src_h: c_int = @intCast(@abs(header.biHeight));
     const box_w: c_int = rect.right - rect.left;
     const box_h: c_int = rect.bottom - rect.top;
+    const dst = fitImageNoUpscale(src_w, src_h, box_w, box_h);
 
-    // Fit image proportionally inside the destination box, centered
-    const dst_w: c_int, const dst_h: c_int = blk: {
-        if (src_w == 0 or src_h == 0) break :blk .{ box_w, box_h };
-        const scale_w = @as(i64, box_w) * @as(i64, src_h);
-        const scale_h = @as(i64, box_h) * @as(i64, src_w);
-        if (scale_w <= scale_h) {
-            // Width-limited
-            const h: c_int = @intCast(@divTrunc((@as(i64, box_w) * @as(i64, src_h)), @as(i64, src_w)));
-            break :blk .{ box_w, h };
-        } else {
-            // Height-limited
-            const w_fit: c_int = @intCast(@divTrunc((@as(i64, box_h) * @as(i64, src_w)), @as(i64, src_h)));
-            break :blk .{ w_fit, box_h };
-        }
-    };
-
-    const x_off = rect.left + @divTrunc(box_w - dst_w, 2);
-    const y_off = rect.top + @divTrunc(box_h - dst_h, 2);
+    const x_off = rect.left + @divTrunc(box_w - dst.width, 2);
+    const y_off = rect.top + @divTrunc(box_h - dst.height, 2);
 
     _ = w.StretchDIBits(
         hdc,
         x_off,
         y_off,
-        dst_w,
-        dst_h,
+        dst.width,
+        dst.height,
         0,
         0,
         src_w,
@@ -1095,7 +1214,7 @@ fn pollHotkeyFallback() void {
     // Always poll hotkeys via GetAsyncKeyState because WM_HOTKEY delivery
     // is unreliable on some Windows configurations. Use timestamp debounce
     // to prevent rapid re-toggle (300ms cooldown).
-    const now = std.time.milliTimestamp();
+    const now = app_io.milliTimestamp();
     if (now - g_hotkey_debounce < 300) return;
 
     // Check Ctrl+Alt+B
@@ -1164,20 +1283,25 @@ fn resolvePasteTarget() w.HWND {
 }
 
 fn hitTestEntryFromLParam(lp: w.LPARAM) ?usize {
-    const len = g_history.len();
-    if (len == 0) return null;
-
     const click_y = getYFromLParam(lp);
+    return hitTestEntryAtY(click_y);
+}
+
+fn hitTestEntryAtY(click_y: i32) ?usize {
+    const len = filteredCount();
+    if (len == 0) return null;
     if (click_y < LIST_TOP) return null;
 
-    var y: c_int = LIST_TOP;
-    var i: usize = g_scroll_from_newest;
+    const card_w = getCardWidth();
+    const view = activeView();
+    const list_y = click_y - LIST_TOP + view.scroll_px;
+    var item_top: c_int = 0;
+    var i: usize = 0;
     while (i < len) : (i += 1) {
-        const entry_idx = (len - 1) - i;
-        const card_h = entryCardHeight(g_history.entries.items[entry_idx]);
-        if (click_y >= y and click_y < y + card_h) return i;
-        y += card_h + CARD_GAP;
-        if (y > 2000) break; // safety
+        const r = filteredEntry(i) orelse break;
+        const card_h = entryCardHeight(r.entry, card_w);
+        if (list_y >= item_top and list_y < item_top + card_h) return i;
+        item_top += card_h + CARD_GAP;
     }
 
     return null;
@@ -1193,26 +1317,34 @@ fn hitTestClick(click_x: i32, click_y: i32) ?HitResult {
 
     var client_rect: w.RECT = .{};
     if (g_picker_hwnd != null) _ = w.GetClientRect(g_picker_hwnd, &client_rect);
-    const card_right = client_rect.right - 20;
+    const client_h = client_rect.bottom - client_rect.top;
+    const viewport_h = listViewportHeight(client_h);
+    if (click_y >= LIST_TOP + viewport_h) return null;
 
-    var y: c_int = LIST_TOP;
-    var i: usize = g_scroll_from_newest;
+    const card_w = cardWidthFromClientRect(client_rect);
+    const card_right = CARD_LEFT + card_w;
+    if (click_x < CARD_LEFT or click_x > card_right) return null;
+
+    const view = activeView();
+    const list_y = click_y - LIST_TOP + view.scroll_px;
+    var item_top: c_int = 0;
+    var i: usize = 0;
     while (i < len) : (i += 1) {
         const r = filteredEntry(i) orelse break;
-        const card_h = entryCardHeight(r.entry);
-        if (click_y >= y and click_y < y + card_h) {
+        const card_h = entryCardHeight(r.entry, card_w);
+        if (list_y >= item_top and list_y < item_top + card_h) {
+            const local_y = list_y - item_top;
             // Check delete icon area (right side)
-            if (click_x >= card_right - 28 and click_x <= card_right - 4 and click_y < y + 24) {
+            if (click_x >= card_right - 28 and click_x <= card_right - 4 and local_y < 24) {
                 return .{ .from_newest = i, .zone = .delete };
             }
             // Check pin icon area (left of delete)
-            if (click_x >= card_right - 52 and click_x < card_right - 28 and click_y < y + 24) {
+            if (click_x >= card_right - 52 and click_x < card_right - 28 and local_y < 24) {
                 return .{ .from_newest = i, .zone = .pin };
             }
             return .{ .from_newest = i, .zone = .body };
         }
-        y += card_h + CARD_GAP;
-        if (y > 2000) break;
+        item_top += card_h + CARD_GAP;
     }
     return null;
 }
@@ -1231,45 +1363,59 @@ fn getYFromLParam(lp: w.LPARAM) i32 {
     return y_i16;
 }
 
-fn scrollBy(delta: i32) void {
-    const len = filteredCount();
-    if (len == 0) return;
-    const max_start: i32 = @intCast(len - 1);
-    var next: i32 = @intCast(g_scroll_from_newest);
-    next += delta;
-    if (next < 0) next = 0;
-    if (next > max_start) next = max_start;
-    g_scroll_from_newest = @intCast(next);
+fn scrollByPixels(delta_px: c_int) void {
+    const flen = filteredCount();
+    if (flen == 0) return;
+
+    const card_w = getCardWidth();
+    const client_h = getClientHeight();
+    const view = activeView();
+    view.scroll_px = clampScrollPx(view.scroll_px + delta_px, card_w, client_h);
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
+}
+
+fn pageScrollAmount() c_int {
+    var amount = listViewportHeight(getClientHeight()) - PAGE_SCROLL_OVERLAP_PX;
+    if (amount < WHEEL_SCROLL_PX) amount = WHEEL_SCROLL_PX;
+    return amount;
+}
+
+const ItemBounds = struct { top: c_int, height: c_int };
+
+fn selectedItemBounds(from_newest: usize, card_width: c_int) ?ItemBounds {
+    var item_top: c_int = 0;
+    var i: usize = 0;
+    while (i <= from_newest) : (i += 1) {
+        const r = filteredEntry(i) orelse return null;
+        const card_h = entryCardHeight(r.entry, card_width);
+        if (i == from_newest) return .{ .top = item_top, .height = card_h };
+        item_top += card_h + CARD_GAP;
+    }
+    return null;
 }
 
 fn ensureSelectionVisible() void {
     const len = filteredCount();
     if (len == 0) return;
+    clampActiveView();
 
-    // If selection is above scroll position, scroll up to it
-    if (g_selected_from_newest < g_scroll_from_newest) {
-        g_scroll_from_newest = g_selected_from_newest;
-        return;
-    }
-
-    // If selection is below visible area, scroll down until it fits
     const client_h = getClientHeight();
-    var y: c_int = LIST_TOP;
-    var i: usize = g_scroll_from_newest;
-    while (i < len) : (i += 1) {
-        const r = filteredEntry(i) orelse break;
-        const card_h = entryCardHeight(r.entry);
-        if (i == g_selected_from_newest) {
-            if (y + card_h > client_h - BOTTOM_MARGIN) {
-                // Selection doesn't fit, scroll down
-                g_scroll_from_newest += 1;
-                return ensureSelectionVisible();
-            }
-            return; // visible
-        }
-        y += card_h + CARD_GAP;
+    const card_w = getCardWidth();
+    const viewport_h = listViewportHeight(client_h);
+    if (viewport_h <= 0) return;
+
+    const view = activeView();
+    const selected = if (view.selected_from_newest < len) view.selected_from_newest else len - 1;
+    const bounds = selectedItemBounds(selected, card_w) orelse return;
+    const selected_top = bounds.top;
+    const selected_bottom = bounds.top + bounds.height;
+
+    if (selected_top < view.scroll_px) {
+        view.scroll_px = selected_top;
+    } else if (selected_bottom > view.scroll_px + viewport_h) {
+        view.scroll_px = selected_bottom - viewport_h;
     }
+    view.scroll_px = clampScrollPx(view.scroll_px, card_w, client_h);
 }
 
 fn getClientHeight() c_int {
@@ -1279,20 +1425,88 @@ fn getClientHeight() c_int {
     return rect.bottom - rect.top;
 }
 
-fn drawScrollbar(hdc: w.HDC, rect: w.RECT, total: usize, start: usize, visible_rows: usize) void {
-    if (total <= visible_rows) return;
+fn getClientWidth() c_int {
+    if (g_picker_hwnd == null) return 368;
+    var rect: w.RECT = .{};
+    if (w.GetClientRect(g_picker_hwnd, &rect) == 0) return 368;
+    return rect.right - rect.left;
+}
+
+fn getCardWidth() c_int {
+    const rect = w.RECT{ .left = 0, .top = 0, .right = getClientWidth(), .bottom = getClientHeight() };
+    return cardWidthFromClientRect(rect);
+}
+
+fn cardWidthFromClientRect(rect: w.RECT) c_int {
+    var card_w = (rect.right - rect.left) - CARD_LEFT - CARD_RIGHT_MARGIN;
+    if (card_w < CARD_MIN_W) card_w = CARD_MIN_W;
+    return card_w;
+}
+
+fn listViewportHeight(client_h: c_int) c_int {
+    var h = client_h - LIST_TOP - BOTTOM_MARGIN;
+    if (h < 0) h = 0;
+    return h;
+}
+
+fn totalContentHeight(card_width: c_int) c_int {
+    const len = filteredCount();
+    var total: c_int = 0;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const r = filteredEntry(i) orelse break;
+        if (i > 0) total += CARD_GAP;
+        total += entryCardHeight(r.entry, card_width);
+    }
+    return total;
+}
+
+fn maxScrollPx(card_width: c_int, client_h: c_int) c_int {
+    const total_h = totalContentHeight(card_width);
+    const viewport_h = listViewportHeight(client_h);
+    if (total_h <= viewport_h) return 0;
+    return total_h - viewport_h;
+}
+
+fn clampScrollPx(scroll_px: c_int, card_width: c_int, client_h: c_int) c_int {
+    const max_scroll = maxScrollPx(card_width, client_h);
+    if (scroll_px < 0) return 0;
+    if (scroll_px > max_scroll) return max_scroll;
+    return scroll_px;
+}
+
+fn clampActiveViewWithMetrics(card_width: c_int, client_h: c_int) void {
+    const view = activeView();
+    const len = filteredCount();
+    if (len == 0) {
+        resetView(view);
+        return;
+    }
+    if (view.selected_from_newest >= len) view.selected_from_newest = len - 1;
+    view.scroll_px = clampScrollPx(view.scroll_px, card_width, client_h);
+}
+
+fn clampActiveView() void {
+    clampActiveViewWithMetrics(getCardWidth(), getClientHeight());
+}
+
+fn drawScrollbar(hdc: w.HDC, rect: w.RECT, total_content_h: c_int, scroll_px: c_int, viewport_h: c_int) void {
+    if (viewport_h <= 0 or total_content_h <= viewport_h) return;
 
     const track_left = rect.right - 6;
     const track_right = rect.right - 4;
     const track_top: c_int = LIST_TOP;
-    const track_bottom: c_int = rect.bottom - 8;
+    const track_bottom: c_int = LIST_TOP + viewport_h;
     const track_h = track_bottom - track_top;
+    if (track_h <= 0) return;
 
-    var thumb_h: i32 = @intCast(@divTrunc((@as(i64, track_h) * @as(i64, @intCast(visible_rows))), @as(i64, @intCast(total))));
+    var thumb_h: c_int = @intCast(@divTrunc(@as(i64, track_h) * @as(i64, viewport_h), @as(i64, total_content_h)));
     if (thumb_h < 24) thumb_h = 24;
-    const max_start = total - visible_rows;
+    if (thumb_h > track_h) thumb_h = track_h;
+
+    const max_scroll = total_content_h - viewport_h;
     const travel = track_h - thumb_h;
-    const thumb_off: i32 = if (max_start == 0) 0 else @intCast(@divTrunc((@as(i64, travel) * @as(i64, @intCast(start))), @as(i64, @intCast(max_start))));
+    const thumb_off: c_int = if (max_scroll == 0) 0 else @intCast(@divTrunc(@as(i64, travel) * @as(i64, scroll_px), @as(i64, max_scroll)));
 
     const thumb = w.RECT{
         .left = track_left,
@@ -1307,19 +1521,17 @@ fn drawScrollbar(hdc: w.HDC, rect: w.RECT, total: usize, start: usize, visible_r
     }
 }
 
-fn entryCardHeight(entry: history.Entry) c_int {
+fn entryCardHeight(entry: history.Entry, card_width: c_int) c_int {
     return switch (entry.item) {
         .text => |text| blk: {
             var lines: [MAX_TEXT_LINES][120]u8 = [_][120]u8{[_]u8{0} ** 120} ** MAX_TEXT_LINES;
-            const lens = wrapTextIntoLines(text, &lines, MAX_TEXT_LINES, MAX_WRAP_CHARS);
-            var count: c_int = 0;
-            for (lens) |l| {
-                if (l > 0) count += 1;
-            }
-            if (count == 0) count = 1;
+            const wrap_chars = textWrapCharsForCardWidth(card_width);
+            const wrapped = wrapTextIntoLines(text, &lines, wrap_chars);
+            var count: c_int = @intCast(wrapped.line_count);
+            if (count < MIN_TEXT_LINES) count = MIN_TEXT_LINES;
             break :blk count * TEXT_LINE_H + TEXT_PAD_V;
         },
-        .image => IMAGE_CARD_H,
+        .image => |img| imageCardHeight(img, card_width),
     };
 }
 
@@ -1329,13 +1541,8 @@ fn getWheelDelta(wparam: w.WPARAM) i16 {
 }
 
 fn initDebugLog() void {
-    const cwd = std.fs.cwd();
-    g_log_file = cwd.openFile("lightboard-debug.log", .{ .mode = .write_only }) catch null;
-    if (g_log_file) |file| {
-        file.seekFromEnd(0) catch {};
-    } else {
-        g_log_file = cwd.createFile("lightboard-debug.log", .{ .truncate = false }) catch null;
-    }
+    const cwd = std.Io.Dir.cwd();
+    g_log_file = cwd.createFile(app_io.io, "lightboard-debug.log", .{ .read = true, .truncate = false }) catch null;
 
     dbgLog("lightboard boot", .{});
 }
@@ -1363,8 +1570,9 @@ fn removeCloseButton(hwnd: w.HWND) void {
 }
 
 fn initPersistence(allocator: std.mem.Allocator) !void {
-    const local_app_data = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch |err| switch (err) {
-        error.EnvironmentVariableNotFound => {
+    const env: std.process.Environ = .{ .block = .global };
+    const local_app_data = env.getAlloc(allocator, "LOCALAPPDATA") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => {
             dbgLog("LOCALAPPDATA not found; persistence disabled", .{});
             g_history_path = &[_]u8{};
             return;
@@ -1375,14 +1583,14 @@ fn initPersistence(allocator: std.mem.Allocator) !void {
 
     const data_dir = try std.fs.path.join(allocator, &[_][]const u8{ local_app_data, "lightboard" });
     defer allocator.free(data_dir);
-    try std.fs.cwd().makePath(data_dir);
+    try std.Io.Dir.cwd().createDirPath(app_io.io, data_dir);
 
     g_history_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, "history.bin" });
     dbgLog("persistence path: {s}", .{g_history_path});
 
     // Set up images directory and compression workspace
     const images_dir = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, "images" });
-    try std.fs.cwd().makePath(images_dir);
+    try std.Io.Dir.cwd().createDirPath(app_io.io, images_dir);
     g_images_dir_path = images_dir;
     img_store.init(allocator, images_dir);
     dbgLog("images dir: {s}", .{images_dir});
@@ -1399,7 +1607,9 @@ fn dbgLog(comptime fmt: []const u8, args: anytype) void {
     if (g_log_file == null) return;
 
     var line_buf: [1024]u8 = undefined;
-    const ts = std.time.timestamp();
+    const ts = app_io.unixTimestamp();
     const line = std.fmt.bufPrint(&line_buf, "[{d}] " ++ fmt ++ "\r\n", .{ts} ++ args) catch return;
-    g_log_file.?.writeAll(line) catch {};
+    const file = g_log_file.?;
+    const stat = file.stat(app_io.io) catch return;
+    file.writePositionalAll(app_io.io, line, stat.size) catch {};
 }
