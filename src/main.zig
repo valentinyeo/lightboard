@@ -8,11 +8,13 @@ const img_store = @import("image_store.zig");
 const MESSAGE_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_msg");
 const PICKER_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_picker");
 const WINDOW_NAME = std.unicode.utf8ToUtf16LeStringLiteral("lightboard");
-const APP_VERSION = "v0.1.2";
-const HOTKEY_ID: usize = 1;
-const HOTKEY_ID_F8: usize = 2;
-const TARGET_TRACK_TIMER_ID: usize = 1;
-const TARGET_TRACK_INTERVAL_MS: w.UINT = 20;
+const APP_VERSION = "v0.2.0";
+const HOTKEY_ID: usize = 1; // Ctrl+Alt+B fallback
+const HOTKEY_ID_F8: usize = 2; // F8 fallback
+const HOTKEY_ID_WINV: usize = 3; // Win+V primary
+const HOTKEY_POLL_TIMER_ID: usize = 10;
+const HOTKEY_POLL_INTERVAL_MS: w.UINT = 150; // only used if a RegisterHotKey call failed
+const HOTKEY_POLL_TOLERANCE_MS: w.DWORD = 100; // SetCoalescableTimer slack
 const TAB_Y: c_int = 8;
 const LIST_TOP: c_int = 32;
 const CARD_GAP: c_int = 4;
@@ -50,17 +52,13 @@ var g_last_target_hwnd: w.HWND = null;
 var g_ui_font: w.HFONT = null;
 var g_history_path: []u8 = &[_]u8{};
 var g_images_dir_path: []u8 = &[_]u8{};
-var g_prev_left_down = false;
-var g_timer_logged = false;
 var g_hotkey_debounce: i64 = 0; // timestamp of last toggle to prevent rapid re-toggle
-var g_kb_hook: w.HHOOK = null; // low-level keyboard hook for Win+V
-var g_win_v_intercept_active = false;
-
-fn winKeyDown() bool {
-    const l = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_LWIN)));
-    const r = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_RWIN)));
-    return l or r;
-}
+var g_win_event_hook: w.HWINEVENTHOOK = null; // event-driven foreground-window tracking
+var g_winv_registered = false;
+var g_f8_needs_poll_fallback = false;
+var g_altb_needs_poll_fallback = false;
+var g_winv_needs_poll_fallback = false;
+var g_poll_timer_running = false;
 
 const ActiveTab = enum { history, pinned };
 const ViewState = struct {
@@ -198,40 +196,80 @@ pub fn main(init: std.process.Init) !void {
         return error.AddClipboardFormatListenerFailed;
     }
     defer _ = w.RemoveClipboardFormatListener(g_message_hwnd);
-    _ = w.SetTimer(g_message_hwnd, TARGET_TRACK_TIMER_ID, TARGET_TRACK_INTERVAL_MS, null);
-    defer _ = w.KillTimer(g_message_hwnd, TARGET_TRACK_TIMER_ID);
 
-    const winv_hooked = installWinVHook();
+    enableEcoQoS();
+
+    // Event-driven foreground-window tracking (WinEvent hook, not a keyboard
+    // hook — safe on this machine). Replaces the old 20ms polling timer.
+    g_win_event_hook = w.SetWinEventHook(
+        w.EVENT_SYSTEM_FOREGROUND,
+        w.EVENT_SYSTEM_FOREGROUND,
+        null,
+        foregroundEventProc,
+        0,
+        0,
+        w.WINEVENT_OUTOFCONTEXT,
+    );
     defer {
-        if (g_kb_hook != null) _ = w.UnhookWindowsHookEx(g_kb_hook);
+        if (g_win_event_hook != null) _ = w.UnhookWinEvent(g_win_event_hook);
     }
+    if (g_win_event_hook == null) {
+        dbgLog("SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed winerr={d}; falling back to remember-on-show only", .{w.GetLastError()});
+    }
+
+    // Win+V is delivered via RegisterHotKey (MOD_WIN|MOD_NOREPEAT), not a
+    // low-level keyboard hook. WH_KEYBOARD_LL crashes this machine and must
+    // never be reintroduced. If Explorer still owns Win+V, this fails and we
+    // fall back to Ctrl+Alt+B / F8; see tools/free-win-v.ps1.
+    g_winv_registered = registerWinVHotkey();
+    defer if (g_winv_registered) {
+        _ = w.UnregisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID_WINV));
+    };
+    g_winv_needs_poll_fallback = !g_winv_registered;
 
     const fallback_hotkey_registered = registerHotkey();
-    if (fallback_hotkey_registered) {
-        defer _ = w.UnregisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID));
-    }
+    defer if (fallback_hotkey_registered) {
+        _ = w.UnregisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID));
+    };
+    g_altb_needs_poll_fallback = !fallback_hotkey_registered;
 
     g_f8_hotkey_registered = w.RegisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID_F8), 0, w.VK_F8) != 0;
+    defer if (g_f8_hotkey_registered) {
+        _ = w.UnregisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID_F8));
+    };
+    g_f8_needs_poll_fallback = !g_f8_hotkey_registered;
     if (g_f8_hotkey_registered) {
-        defer _ = w.UnregisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID_F8));
         dbgLog("registered backup hotkey: F8", .{});
     } else {
         dbgLog("failed backup hotkey F8 winerr={d}", .{w.GetLastError()});
     }
 
-    if (winv_hooked) {
+    // Poll-fallback timer: only runs if a RegisterHotKey call above failed.
+    // When all three succeed (the common case) there is no timer at all
+    // while the picker is hidden — zero idle wakeups. If it does run, it's
+    // coalesced and well above 100ms per the no-tight-polling rule.
+    if (g_winv_needs_poll_fallback or g_altb_needs_poll_fallback or g_f8_needs_poll_fallback) {
+        _ = w.SetCoalescableTimer(g_message_hwnd, HOTKEY_POLL_TIMER_ID, HOTKEY_POLL_INTERVAL_MS, null, HOTKEY_POLL_TOLERANCE_MS);
+        g_poll_timer_running = true;
+        dbgLog("hotkey poll-fallback timer started ({d}ms coalesced): winv={} altb={} f8={}", .{ HOTKEY_POLL_INTERVAL_MS, g_winv_needs_poll_fallback, g_altb_needs_poll_fallback, g_f8_needs_poll_fallback });
+    }
+    defer if (g_poll_timer_running) {
+        _ = w.KillTimer(g_message_hwnd, HOTKEY_POLL_TIMER_ID);
+    };
+
+    if (g_winv_registered) {
         g_hotkey_label = "Win+V";
         g_hotkey_registered = true;
         std.log.info("lightboard running (Win+V opens picker)", .{});
-        dbgLog("hotkey active: Win+V (LL hook), fallback Ctrl+Alt+B={}, F8={}", .{ fallback_hotkey_registered, g_f8_hotkey_registered });
+        dbgLog("hotkey active: Win+V (RegisterHotKey), fallback Ctrl+Alt+B={}, F8={}", .{ fallback_hotkey_registered, g_f8_hotkey_registered });
     } else if (fallback_hotkey_registered) {
-        std.log.warn("lightboard running (Win+V hook unavailable; Ctrl+Alt+B opens picker)", .{});
+        std.log.warn("lightboard running (Win+V unavailable; Ctrl+Alt+B opens picker). Explorer likely still owns Win+V - run tools\\free-win-v.ps1 (elevated) to free it, then restart lightboard.", .{});
         dbgLog("hotkey active: Ctrl+Alt+B fallback, F8={}", .{g_f8_hotkey_registered});
     } else if (g_f8_hotkey_registered) {
-        std.log.warn("lightboard running (Win+V/Ctrl+Alt+B unavailable; F8 opens picker)", .{});
+        std.log.warn("lightboard running (Win+V/Ctrl+Alt+B unavailable; F8 opens picker). Run tools\\free-win-v.ps1 (elevated) to free Win+V from Explorer.", .{});
         dbgLog("hotkey active: F8 backup only", .{});
     } else {
-        std.log.warn("lightboard running with no registered hotkey", .{});
+        std.log.warn("lightboard running with no registered hotkey. Run tools\\free-win-v.ps1 (elevated) to free Win+V from Explorer.", .{});
         dbgLog("no registered hotkey available", .{});
     }
 
@@ -259,68 +297,37 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn llKeyboardProc(nCode: w.INT, wParam: w.WPARAM, lParam: w.LPARAM) callconv(w.WINAPI) w.LRESULT {
-    if (nCode == w.HC_ACTION) {
-        const kb: *const w.KBDLLHOOKSTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
-        const msg = @as(w.UINT, @intCast(wParam));
-        const is_keydown = (msg == w.WM_KEYDOWN_LL or msg == w.WM_SYSKEYDOWN);
-        const is_keyup = (msg == w.WM_KEYUP_LL or msg == w.WM_SYSKEYUP);
-
-        const win_down = winKeyDown();
-        if (kb.vkCode == w.VK_V) {
-            if (is_keydown) {
-                if (!win_down) {
-                    g_win_v_intercept_active = false;
-                    return w.CallNextHookEx(g_kb_hook, nCode, wParam, lParam);
-                }
-
-                g_win_v_intercept_active = true;
-
-                // Prevent the Start menu from opening when Win is released.
-                var dummy = [2]w.INPUT{
-                    .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{ .wVk = w.VK_LSHIFT } } },
-                    .{ .type = w.INPUT_KEYBOARD, .u = .{ .ki = .{ .wVk = w.VK_LSHIFT, .dwFlags = w.KEYEVENTF_KEYUP } } },
-                };
-                _ = w.SendInput(2, &dummy, @sizeOf(w.INPUT));
-
-                _ = w.PostMessageW(g_message_hwnd, w.WM_APP, 0, 0);
-                dbgLog("LL hook: Win+V intercepted, posting WM_APP", .{});
-                return 1;
-            }
-
-            if (is_keyup and g_win_v_intercept_active) {
-                g_win_v_intercept_active = false;
-                return 1;
-            }
-        }
-
-        if (g_picker_hwnd != null and w.IsWindowVisible(g_picker_hwnd) != 0 and win_down) {
-            const vk = @as(w.UINT, @intCast(kb.vkCode));
-            const is_nav = (vk == w.VK_UP or vk == w.VK_DOWN or
-                vk == w.VK_J or vk == w.VK_K or
-                vk == w.VK_RETURN or vk == w.VK_ESCAPE or
-                vk == w.VK_PRIOR or vk == w.VK_NEXT or
-                vk == w.VK_DELETE or vk == w.VK_X or vk == w.VK_S);
-            if (is_nav) {
-                if (is_keydown) {
-                    _ = w.PostMessageW(g_picker_hwnd, w.WM_KEYDOWN, vk, 0);
-                }
-                return 1;
-            }
-        }
+// WinEvent callback: fires only on real foreground-window changes (event
+// driven, no polling). Mirrors what the old 20ms `trackForegroundTarget`
+// poll did, minus the per-tick wakeup cost.
+fn foregroundEventProc(
+    hook: w.HWINEVENTHOOK,
+    event: w.DWORD,
+    hwnd: w.HWND,
+    id_object: c_long,
+    id_child: c_long,
+    id_event_thread: w.DWORD,
+    dwms_event_time: w.DWORD,
+) callconv(w.WINAPI) void {
+    _ = hook;
+    _ = event;
+    _ = id_object;
+    _ = id_child;
+    _ = id_event_thread;
+    _ = dwms_event_time;
+    if (hwnd != null and hwnd != g_picker_hwnd and hwnd != g_message_hwnd) {
+        g_last_target_hwnd = hwnd;
     }
-    return w.CallNextHookEx(g_kb_hook, nCode, wParam, lParam);
 }
 
-fn installWinVHook() bool {
-    g_kb_hook = w.SetWindowsHookExW(w.WH_KEYBOARD_LL, llKeyboardProc, w.GetModuleHandleW(null), 0);
-    if (g_kb_hook != null) {
-        dbgLog("installed LL keyboard hook for Win+V", .{});
+fn registerWinVHotkey() bool {
+    dbgLog("trying hotkey: Win+V", .{});
+    if (w.RegisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID_WINV), w.MOD_WIN | w.MOD_NOREPEAT, w.VK_V) != 0) {
+        dbgLog("registered hotkey: Win+V", .{});
         return true;
-    } else {
-        dbgLog("failed LL keyboard hook winerr={d}", .{w.GetLastError()});
-        return false;
     }
+    dbgLog("failed hotkey: Win+V winerr={d} (Explorer likely owns Win+V; see tools/free-win-v.ps1)", .{w.GetLastError()});
+    return false;
 }
 
 fn registerHotkey() bool {
@@ -344,17 +351,8 @@ fn registerHotkey() bool {
 
 fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callconv(w.WINAPI) w.LRESULT {
     switch (msg) {
-        w.WM_APP => {
-            dbgLog("WM_APP: Win+V hook toggle", .{});
-            const now = app_io.milliTimestamp();
-            if (now - g_hotkey_debounce >= 300) {
-                g_hotkey_debounce = now;
-                togglePicker();
-            }
-            return 0;
-        },
         w.WM_HOTKEY => {
-            if (wparam == HOTKEY_ID or wparam == HOTKEY_ID_F8) {
+            if (wparam == HOTKEY_ID or wparam == HOTKEY_ID_F8 or wparam == HOTKEY_ID_WINV) {
                 const now = app_io.milliTimestamp();
                 if (now - g_hotkey_debounce >= 300) {
                     g_hotkey_debounce = now;
@@ -371,22 +369,26 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
             return 0;
         },
         w.WM_TIMER => {
-            if (wparam == TARGET_TRACK_TIMER_ID) {
-                if (!g_timer_logged) {
-                    g_timer_logged = true;
-                    dbgLog("WM_TIMER first tick confirmed", .{});
-                }
-                trackForegroundTarget();
+            if (wparam == HOTKEY_POLL_TIMER_ID) {
+                // Only reached at all when at least one RegisterHotKey call
+                // failed at startup; see main(). Coalesced, >=100ms.
                 pollHotkeyFallback();
-                hideOnOutsideClick();
                 return 0;
             }
         },
         w.WM_ACTIVATE => {
             if (g_picker_hwnd != null and hwnd == g_picker_hwnd) {
-                if ((wparam & 0xFFFF) != w.WA_INACTIVE) {
+                if ((wparam & 0xFFFF) == w.WA_INACTIVE) {
+                    hidePicker("deactivate");
+                } else {
                     _ = w.SetFocus(g_picker_hwnd);
                 }
+                return 0;
+            }
+        },
+        w.WM_KILLFOCUS => {
+            if (g_picker_hwnd != null and hwnd == g_picker_hwnd) {
+                hidePicker("killfocus");
                 return 0;
             }
         },
@@ -453,8 +455,7 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
         },
         w.WM_CLOSE => {
             if (g_picker_hwnd != null and hwnd == g_picker_hwnd) {
-                _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
-                dbgLog("picker hidden by close", .{});
+                hidePicker("close");
                 return 0;
             }
         },
@@ -517,17 +518,33 @@ fn togglePicker() void {
     if (g_picker_hwnd == null) return;
 
     if (w.IsWindowVisible(g_picker_hwnd) != 0) {
-        _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
-        dbgLog("picker hidden by hotkey", .{});
+        hidePicker("hotkey");
         return;
     }
 
+    showPicker();
+    dbgLog("picker shown by hotkey", .{});
+}
+
+// Idle = zero timers. There is currently nothing that needs a timer while
+// the picker is visible either (foreground tracking is event-driven via
+// SetWinEventHook, and outside-click hiding is WM_ACTIVATE/WM_KILLFOCUS
+// driven) — these are no-ops today but kept so a future visible-only need
+// has an obvious home instead of resurrecting an always-on timer.
+fn showPicker() void {
+    if (g_picker_hwnd == null) return;
     rememberTargetWindow();
     resetActiveView();
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     _ = w.ShowWindow(g_picker_hwnd, w.SW_SHOW);
     forceForeground(g_picker_hwnd);
-    dbgLog("picker shown by hotkey", .{});
+}
+
+fn hidePicker(reason: []const u8) void {
+    if (g_picker_hwnd == null) return;
+    if (w.IsWindowVisible(g_picker_hwnd) == 0) return;
+    _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
+    dbgLog("picker hidden by {s}", .{reason});
 }
 
 fn forceForeground(hwnd: w.HWND) void {
@@ -558,8 +575,7 @@ fn handlePickerKey(key: w.UINT) void {
     const ctrl_held = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
     switch (key) {
         w.VK_ESCAPE => {
-            _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
-            dbgLog("picker hidden by Esc", .{});
+            hidePicker("Esc");
         },
         w.VK_UP => {
             moveSelection(-1);
@@ -648,7 +664,7 @@ fn pasteSelection() void {
     };
 
     g_ignore_clipboard_updates = 1;
-    _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
+    hidePicker("paste");
     dbgLog("pasting selected entry", .{});
 
     const target = resolvePasteTarget();
@@ -747,7 +763,7 @@ fn openSelectedImage() void {
         w.SW_SHOW,
     );
 
-    _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
+    hidePicker("open image");
 }
 
 fn deleteSelected() void {
@@ -1203,63 +1219,45 @@ fn rememberTargetWindow() void {
     }
 }
 
-fn trackForegroundTarget() void {
-    const fg = w.GetForegroundWindow();
-    if (fg != null and fg != g_picker_hwnd and fg != g_message_hwnd) {
-        g_last_target_hwnd = fg;
-    }
-}
-
+// Only reached via HOTKEY_POLL_TIMER_ID, which only exists when at least one
+// RegisterHotKey call failed at startup (see main()). Each branch is gated
+// on its own *_needs_poll_fallback flag so a hotkey that registered
+// successfully is never redundantly polled — WM_HOTKEY already covers it.
 fn pollHotkeyFallback() void {
-    // Always poll hotkeys via GetAsyncKeyState because WM_HOTKEY delivery
-    // is unreliable on some Windows configurations. Use timestamp debounce
-    // to prevent rapid re-toggle (300ms cooldown).
     const now = app_io.milliTimestamp();
     if (now - g_hotkey_debounce < 300) return;
 
-    // Check Ctrl+Alt+B
-    const ctrl_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
-    const alt_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_MENU)));
-    const b_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_B)));
-    if (ctrl_down and alt_down and b_down) {
-        dbgLog("poll detected: Ctrl+Alt+B", .{});
-        g_hotkey_debounce = now;
-        togglePicker();
-        return;
+    if (g_winv_needs_poll_fallback) {
+        const win_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_LWIN))) or highBitSet(w.GetAsyncKeyState(@intCast(w.VK_RWIN)));
+        const v_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_V)));
+        if (win_down and v_down) {
+            dbgLog("poll detected: Win+V", .{});
+            g_hotkey_debounce = now;
+            togglePicker();
+            return;
+        }
     }
 
-    // Check F8
-    const f8_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_F8)));
-    if (f8_down) {
-        dbgLog("poll detected: F8", .{});
-        g_hotkey_debounce = now;
-        togglePicker();
-        return;
-    }
-}
-
-fn hideOnOutsideClick() void {
-    if (g_picker_hwnd == null) return;
-    if (w.IsWindowVisible(g_picker_hwnd) == 0) {
-        g_prev_left_down = false;
-        return;
+    if (g_altb_needs_poll_fallback) {
+        const ctrl_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_CONTROL)));
+        const alt_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_MENU)));
+        const b_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_B)));
+        if (ctrl_down and alt_down and b_down) {
+            dbgLog("poll detected: Ctrl+Alt+B", .{});
+            g_hotkey_debounce = now;
+            togglePicker();
+            return;
+        }
     }
 
-    const left_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_LBUTTON)));
-    const just_pressed = left_down and !g_prev_left_down;
-    g_prev_left_down = left_down;
-    if (!just_pressed) return;
-
-    var cursor: w.POINT = .{};
-    if (w.GetCursorPos(&cursor) == 0) return;
-
-    var wr: w.RECT = .{};
-    if (w.GetWindowRect(g_picker_hwnd, &wr) == 0) return;
-
-    const inside = cursor.x >= wr.left and cursor.x <= wr.right and cursor.y >= wr.top and cursor.y <= wr.bottom;
-    if (!inside) {
-        _ = w.ShowWindow(g_picker_hwnd, w.SW_HIDE);
-        dbgLog("picker hidden by outside click", .{});
+    if (g_f8_needs_poll_fallback) {
+        const f8_down = highBitSet(w.GetAsyncKeyState(@intCast(w.VK_F8)));
+        if (f8_down) {
+            dbgLog("poll detected: F8", .{});
+            g_hotkey_debounce = now;
+            togglePicker();
+            return;
+        }
     }
 }
 
@@ -1538,6 +1536,30 @@ fn entryCardHeight(entry: history.Entry, card_width: c_int) c_int {
 fn getWheelDelta(wparam: w.WPARAM) i16 {
     const hi: u16 = @truncate((wparam >> 16) & 0xFFFF);
     return @bitCast(hi);
+}
+
+// EcoQoS: ask the scheduler to run this process on efficiency cores / at
+// lower clocks when it's not the thing the user is actively interacting
+// with. Cheap to leave on all the time for a background hotkey utility with
+// no latency-critical hot path; if picker responsiveness ever suffers, this
+// is the first thing to make visible-only.
+fn enableEcoQoS() void {
+    var state = w.PROCESS_POWER_THROTTLING_STATE{
+        .Version = w.PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        .ControlMask = w.PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        .StateMask = w.PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    };
+    const ok = w.SetProcessInformation(
+        w.GetCurrentProcess(),
+        w.ProcessPowerThrottling,
+        &state,
+        @sizeOf(w.PROCESS_POWER_THROTTLING_STATE),
+    );
+    if (ok == 0) {
+        dbgLog("SetProcessInformation(EcoQoS) failed winerr={d}", .{w.GetLastError()});
+    } else {
+        dbgLog("EcoQoS enabled", .{});
+    }
 }
 
 fn initDebugLog() void {

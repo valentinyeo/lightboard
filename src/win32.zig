@@ -63,6 +63,7 @@ pub const MOD_WIN: UINT = 0x0008;
 pub const MOD_CONTROL: UINT = 0x0002;
 pub const MOD_SHIFT: UINT = 0x0004;
 pub const MOD_ALT: UINT = 0x0001;
+pub const MOD_NOREPEAT: UINT = 0x4000;
 pub const VK_V: UINT = 0x56;
 pub const VK_B: UINT = 0x42;
 pub const VK_J: UINT = 0x4A;
@@ -81,8 +82,9 @@ pub const VK_S: UINT = 0x53;
 pub const VK_TAB: UINT = 0x09;
 pub const VK_X: UINT = 0x58;
 pub const VK_F8: UINT = 0x77;
-pub const VK_LSHIFT: u16 = 0xA0;
 pub const VK_F24: u16 = 0x87;
+pub const VK_LWIN: UINT = 0x5B;
+pub const VK_RWIN: UINT = 0x5C;
 pub const WHITE_BRUSH: INT = 0;
 pub const GMEM_MOVEABLE: UINT = 0x0002;
 pub const GMEM_ZEROINIT: UINT = 0x0040;
@@ -313,31 +315,54 @@ pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(WINAPI) HBRUSH;
 pub extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(WINAPI) BOOL;
 pub extern "dwmapi" fn DwmSetWindowAttribute(hwnd: HWND, dwAttribute: DWORD, pvAttribute: *const anyopaque, cbAttribute: DWORD) callconv(WINAPI) i32;
 
-pub const HHOOK = ?*anyopaque;
-pub const WH_KEYBOARD_LL: INT = 13;
-pub const HC_ACTION: INT = 0;
-pub const WM_KEYDOWN_LL: UINT = 0x0100;
-pub const WM_KEYUP_LL: UINT = 0x0101;
-pub const WM_SYSKEYDOWN: UINT = 0x0104;
-pub const WM_SYSKEYUP: UINT = 0x0105;
-pub const WM_APP: UINT = 0x8000;
-pub const VK_LWIN: UINT = 0x5B;
-pub const VK_RWIN: UINT = 0x5C;
-pub const LLKHF_INJECTED: DWORD = 0x00000010;
-
-pub const KBDLLHOOKSTRUCT = extern struct {
-    vkCode: DWORD,
-    scanCode: DWORD,
-    flags: DWORD,
-    time: DWORD,
-    dwExtraInfo: usize,
-};
-
-pub const HOOKPROC = *const fn (INT, WPARAM, LPARAM) callconv(WINAPI) LRESULT;
-pub extern "user32" fn SetWindowsHookExW(idHook: INT, lpfn: HOOKPROC, hmod: HINSTANCE, dwThreadId: DWORD) callconv(WINAPI) HHOOK;
-pub extern "user32" fn CallNextHookEx(hhk: HHOOK, nCode: INT, wParam: WPARAM, lParam: LPARAM) callconv(WINAPI) LRESULT;
-pub extern "user32" fn UnhookWindowsHookEx(hhk: HHOOK) callconv(WINAPI) BOOL;
+// NOTE: WH_KEYBOARD_LL (low-level keyboard hook) is intentionally not bound
+// here. It crashes this machine — do not reintroduce it. Win+V is delivered
+// via RegisterHotKey below; foreground-window tracking uses SetWinEventHook
+// (a WinEvent hook, not a keyboard hook).
 pub extern "user32" fn PostMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(WINAPI) BOOL;
+
+// WinEvent hook (EVENT_SYSTEM_FOREGROUND) for event-driven foreground tracking.
+pub const HWINEVENTHOOK = ?*anyopaque;
+pub const WINEVENT_OUTOFCONTEXT: DWORD = 0x0000;
+pub const EVENT_SYSTEM_FOREGROUND: DWORD = 0x0003;
+pub const WINEVENTPROC = *const fn (HWINEVENTHOOK, DWORD, HWND, c_long, c_long, DWORD, DWORD) callconv(WINAPI) void;
+pub extern "user32" fn SetWinEventHook(
+    eventMin: DWORD,
+    eventMax: DWORD,
+    hmodWinEventProc: HINSTANCE,
+    pfnWinEventProc: WINEVENTPROC,
+    idProcess: DWORD,
+    idThread: DWORD,
+    dwFlags: DWORD,
+) callconv(WINAPI) HWINEVENTHOOK;
+pub extern "user32" fn UnhookWinEvent(hWinEventHook: HWINEVENTHOOK) callconv(WINAPI) BOOL;
+
+// Coalescable timer for the low-frequency hotkey-poll fallback (only used
+// when RegisterHotKey fails for a hotkey; see pollHotkeyFallback).
+pub extern "user32" fn SetCoalescableTimer(
+    hWnd: HWND,
+    nIDEvent: UINT_PTR,
+    uElapse: UINT,
+    lpTimerFunc: ?*const anyopaque,
+    uToleranceDelay: DWORD,
+) callconv(WINAPI) UINT_PTR;
+
+// EcoQoS / process power throttling.
+pub extern "kernel32" fn GetCurrentProcess() callconv(WINAPI) HANDLE;
+pub extern "kernel32" fn SetProcessInformation(
+    hProcess: HANDLE,
+    ProcessInformationClass: c_int,
+    ProcessInformation: *const anyopaque,
+    ProcessInformationSize: DWORD,
+) callconv(WINAPI) BOOL;
+pub const ProcessPowerThrottling: c_int = 4;
+pub const PROCESS_POWER_THROTTLING_CURRENT_VERSION: DWORD = 1;
+pub const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: DWORD = 0x1;
+pub const PROCESS_POWER_THROTTLING_STATE = extern struct {
+    Version: DWORD,
+    ControlMask: DWORD,
+    StateMask: DWORD,
+};
 
 pub extern "shell32" fn ShellExecuteW(
     hwnd: HWND,
