@@ -4,6 +4,7 @@ const app_io = @import("app_io.zig");
 const clip = @import("clipboard.zig");
 const history = @import("history.zig");
 const img_store = @import("image_store.zig");
+const build_options = @import("build_options");
 
 const MESSAGE_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_msg");
 const PICKER_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_picker");
@@ -1563,6 +1564,8 @@ fn enableEcoQoS() void {
 }
 
 fn initDebugLog() void {
+    if (!build_options.debug_log) return;
+
     const cwd = std.Io.Dir.cwd();
     g_log_file = cwd.createFile(app_io.io, "lightboard-debug.log", .{ .read = true, .truncate = false }) catch null;
 
