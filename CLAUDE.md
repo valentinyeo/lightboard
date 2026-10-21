@@ -29,7 +29,7 @@ Links libc. Targets Windows only (subsystem = .Windows).
 
 Output binary: `zig-out/bin/lightboard.exe`
 
-No tests, linter, or formatter configured yet. Use `"$ZIG" fmt src/` if needed.
+Run `zig build test` for host-native clipboard privacy policy tests, including during Windows cross-compilation. Use `"$ZIG" fmt src/ build.zig` for formatting.
 
 ## MANDATORY: After Every Code Change
 
@@ -118,6 +118,7 @@ Lightboard is a Windows clipboard history manager written in pure Zig with no ex
 
 - **Two windows**: A hidden message-only window (`g_message_hwnd`) receives clipboard updates and hotkey messages. A visible picker window (`g_picker_hwnd`) displays history and handles user interaction.
 - **Hotkeys**: `Win+V`, `Ctrl+Alt+B`, and `F8` are all registered with `RegisterHotKey` and delivered as `WM_HOTKEY`. No keyboard hook is involved (see "No WH_KEYBOARD_LL" above). A low-frequency poll-fallback timer (`pollHotkeyFallback`, `HOTKEY_POLL_TIMER_ID`, `SetCoalescableTimer`, ≥100ms) only exists at all if one of the three `RegisterHotKey` calls failed at startup; if all three succeed there is no fallback timer.
+- **Clipboard privacy**: `clipboard.capture()` checks registered `ExcludeClipboardContentFromMonitorProcessing` presence and `CanIncludeInClipboardHistory` DWORD zero while the clipboard is open, before reading text/images. The pure `shouldRecord()` policy has host-native tests. Excluded updates return `ClipboardMonitoringExcluded`, logged by `onClipboardUpdate()` via `dbgLog` without modifying history.
 - **Self-trigger guard**: `g_ignore_clipboard_updates` counter prevents re-capturing items we just pasted.
 - **Target window tracking**: Event-driven via `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT)` (`foregroundEventProc` in `src/main.zig`) — updates `g_last_target_hwnd` only when the foreground window actually changes, no polling. `rememberTargetWindow()` also runs on picker show as a defensive fallback in case the WinEvent hook failed to install.
 - **Picker rendering**: Custom GDI paint in `paintPicker()` - dark theme, card-style layout, scrollbar, text wrapping, and DIB thumbnail rendering for images.

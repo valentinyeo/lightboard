@@ -12,9 +12,45 @@ const RawImage = struct {
     data: []u8,
 };
 
+pub fn shouldRecord(exclude_present: bool, can_include: ?u32) bool {
+    return !exclude_present and (can_include == null or can_include.? != 0);
+}
+
+test "clipboard monitoring privacy policy" {
+    const cases = [_]struct { exclude_present: bool, can_include: ?u32, expected: bool }{
+        .{ .exclude_present = false, .can_include = null, .expected = true },
+        .{ .exclude_present = false, .can_include = 0, .expected = false },
+        .{ .exclude_present = false, .can_include = 1, .expected = true },
+        .{ .exclude_present = false, .can_include = 42, .expected = true },
+        .{ .exclude_present = true, .can_include = null, .expected = false },
+        .{ .exclude_present = true, .can_include = 0, .expected = false },
+        .{ .exclude_present = true, .can_include = 1, .expected = false },
+        .{ .exclude_present = true, .can_include = 42, .expected = false },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case.expected, shouldRecord(case.exclude_present, case.can_include));
+    }
+}
+
 pub fn capture(allocator: std.mem.Allocator) !?history.Entry {
     if (w.OpenClipboard(null) == 0) return null;
     defer _ = w.CloseClipboard();
+
+    const exclude_format = w.RegisterClipboardFormatW(std.unicode.utf8ToUtf16LeStringLiteral("ExcludeClipboardContentFromMonitorProcessing"));
+    const history_format = w.RegisterClipboardFormatW(std.unicode.utf8ToUtf16LeStringLiteral("CanIncludeInClipboardHistory"));
+    const exclude_present = exclude_format != 0 and w.IsClipboardFormatAvailable(exclude_format) != 0;
+    var can_include: ?u32 = null;
+    if (history_format != 0 and w.IsClipboardFormatAvailable(history_format) != 0) {
+        const handle = w.GetClipboardData(history_format);
+        if (handle != null and w.GlobalSize(handle) >= @sizeOf(u32)) {
+            if (w.GlobalLock(handle)) |raw| {
+                defer _ = w.GlobalUnlock(handle);
+                const bytes: [*]const u8 = @ptrCast(raw);
+                can_include = std.mem.readInt(u32, bytes[0..4], .little);
+            }
+        }
+    }
+    if (!shouldRecord(exclude_present, can_include)) return error.ClipboardMonitoringExcluded;
 
     if (w.IsClipboardFormatAvailable(w.CF_UNICODETEXT) != 0) {
         const maybe_text = try readUnicodeText(allocator);

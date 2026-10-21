@@ -48,6 +48,16 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/clipboard.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const test_step = b.step("test", "Run clipboard policy tests on the build host");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+
     const run_step = b.step("run", "Run lightboard");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);

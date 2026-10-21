@@ -265,6 +265,7 @@ pub extern "user32" fn BeginPaint(hWnd: HWND, lpPaint: *PAINTSTRUCT) callconv(WI
 pub extern "user32" fn EndPaint(hWnd: HWND, lpPaint: *const PAINTSTRUCT) callconv(WINAPI) BOOL;
 pub extern "user32" fn GetClientRect(hWnd: HWND, lpRect: *RECT) callconv(WINAPI) BOOL;
 pub extern "user32" fn FillRect(hDC: HDC, lprc: *const RECT, hbr: HBRUSH) callconv(WINAPI) INT;
+pub extern "user32" fn RegisterClipboardFormatW(lpszFormat: LPCWSTR) callconv(WINAPI) UINT;
 pub extern "user32" fn OpenClipboard(hWndNewOwner: HWND) callconv(WINAPI) BOOL;
 pub extern "user32" fn CloseClipboard() callconv(WINAPI) BOOL;
 pub extern "user32" fn EmptyClipboard() callconv(WINAPI) BOOL;

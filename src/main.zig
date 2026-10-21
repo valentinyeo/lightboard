@@ -482,6 +482,10 @@ fn onClipboardUpdate() void {
     const allocator = gpa.allocator();
 
     const maybe_entry = clip.capture(allocator) catch |err| {
+        if (err == error.ClipboardMonitoringExcluded) {
+            dbgLog("clipboard update ignored (monitor/history exclusion)", .{});
+            return;
+        }
         std.log.err("clipboard capture failed: {s}", .{@errorName(err)});
         return;
     };
