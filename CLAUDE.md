@@ -31,6 +31,13 @@ Output binary: `zig-out/bin/lightboard.exe`
 
 Run `zig build test` for host-native clipboard privacy policy tests, including during Windows cross-compilation. Use `"$ZIG" fmt src/ build.zig` for formatting.
 
+GitHub Actions pins Zig 0.16.0 on `windows-latest`. `.github/workflows/test.yml`
+runs `zig build test` on `master` pushes and pull requests.
+`.github/workflows/release.yml` tests an existing `vX.Y.Z` tag, builds with
+`zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows`, and publishes
+`lightboard.exe` with `SHA256SUMS.txt`. Tag pushes publish automatically; manual
+runs can retry an existing tag and replace its release assets.
+
 ## MANDATORY: After Every Code Change
 
 After every code change, always do all of the following in order:
