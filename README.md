@@ -28,6 +28,20 @@ Minimal Windows clipboard manager prototype focused on low overhead.
 zig build
 ```
 
+## Tests and releases
+
+GitHub Actions runs `zig build test` on Windows for pushes to `master` and pull
+requests, including the clipboard privacy policy tests. CI pins Zig 0.16.0.
+
+Push a tag such as `v1.2.3` to publish a release, or run the **Release** workflow
+manually with an existing `vX.Y.Z` tag to retry it. The workflow checks out that
+exact tag, runs the tests, then builds Windows x86_64 with
+`zig build -Doptimize=ReleaseSmall -Dtarget=x86_64-windows`. It creates the GitHub
+release if needed and uploads `lightboard.exe` and `SHA256SUMS.txt`; retries
+replace those assets. Download both into the same directory and verify with
+`sha256sum -c SHA256SUMS.txt` (or compare `Get-FileHash lightboard.exe -Algorithm
+SHA256` in PowerShell). No locally built executable is uploaded.
+
 ## Run
 ```powershell
 zig build run
