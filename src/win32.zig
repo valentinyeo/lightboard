@@ -70,8 +70,8 @@ pub const VK_J: UINT = 0x4A;
 pub const VK_K: UINT = 0x4B;
 pub const VK_UP: UINT = 0x26;
 pub const VK_DOWN: UINT = 0x28;
-pub const VK_PRIOR: UINT = 0x21; // PageUp
-pub const VK_NEXT: UINT = 0x22; // PageDown
+pub const VK_PRIOR: UINT = 0x21;
+pub const VK_NEXT: UINT = 0x22;
 pub const VK_RETURN: UINT = 0x0D;
 pub const VK_ESCAPE: UINT = 0x1B;
 pub const VK_CONTROL: UINT = 0x11;
@@ -316,13 +316,8 @@ pub extern "gdi32" fn CreateSolidBrush(color: COLORREF) callconv(WINAPI) HBRUSH;
 pub extern "gdi32" fn DeleteObject(ho: ?*anyopaque) callconv(WINAPI) BOOL;
 pub extern "dwmapi" fn DwmSetWindowAttribute(hwnd: HWND, dwAttribute: DWORD, pvAttribute: *const anyopaque, cbAttribute: DWORD) callconv(WINAPI) i32;
 
-// NOTE: WH_KEYBOARD_LL (low-level keyboard hook) is intentionally not bound
-// here. It crashes this machine — do not reintroduce it. Win+V is delivered
-// via RegisterHotKey below; foreground-window tracking uses SetWinEventHook
-// (a WinEvent hook, not a keyboard hook).
 pub extern "user32" fn PostMessageW(hWnd: HWND, msg: UINT, wParam: WPARAM, lParam: LPARAM) callconv(WINAPI) BOOL;
 
-// WinEvent hook (EVENT_SYSTEM_FOREGROUND) for event-driven foreground tracking.
 pub const HWINEVENTHOOK = ?*anyopaque;
 pub const WINEVENT_OUTOFCONTEXT: DWORD = 0x0000;
 pub const EVENT_SYSTEM_FOREGROUND: DWORD = 0x0003;
@@ -338,8 +333,6 @@ pub extern "user32" fn SetWinEventHook(
 ) callconv(WINAPI) HWINEVENTHOOK;
 pub extern "user32" fn UnhookWinEvent(hWinEventHook: HWINEVENTHOOK) callconv(WINAPI) BOOL;
 
-// Coalescable timer for the low-frequency hotkey-poll fallback (only used
-// when RegisterHotKey fails for a hotkey; see pollHotkeyFallback).
 pub extern "user32" fn SetCoalescableTimer(
     hWnd: HWND,
     nIDEvent: UINT_PTR,
@@ -348,7 +341,6 @@ pub extern "user32" fn SetCoalescableTimer(
     uToleranceDelay: DWORD,
 ) callconv(WINAPI) UINT_PTR;
 
-// EcoQoS / process power throttling.
 pub extern "kernel32" fn GetCurrentProcess() callconv(WINAPI) HANDLE;
 pub extern "kernel32" fn SetProcessInformation(
     hProcess: HANDLE,
@@ -380,7 +372,6 @@ pub const DWMWA_CAPTION_COLOR: DWORD = 35;
 pub const DWMWA_TEXT_COLOR: DWORD = 36;
 pub const DWMWCP_ROUND: DWORD = 2;
 
-// ntdll compression (LZNT1)
 pub const COMPRESSION_FORMAT_LZNT1: u16 = 0x0002;
 pub const COMPRESSION_ENGINE_STANDARD: u16 = 0x0000;
 pub const COMPRESSION_ENGINE_MAXIMUM: u16 = 0x0100;

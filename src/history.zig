@@ -53,7 +53,6 @@ pub const History = struct {
 
         try self.entries.append(allocator, entry);
         while (self.entries.items.len > self.max_items) {
-            // Find first non-sticky entry from oldest end to evict
             var evict_idx: ?usize = null;
             for (self.entries.items, 0..) |e, ei| {
                 if (!e.sticky) {
@@ -65,7 +64,6 @@ pub const History = struct {
                 const removed = self.entries.orderedRemove(idx);
                 freeEntryData(allocator, removed);
             } else {
-                // All entries are sticky — allow buffer to exceed max
                 break;
             }
         }
@@ -190,7 +188,6 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
         const kind = try reader.readByte();
 
         if (kind == 1) {
-            // Text entry; same layout across all versions.
             const text_len = try reader.readIntLe(u32);
             const text_bytes = try reader.readBytes(text_len);
             const text = try allocator.dupe(u8, text_bytes);
@@ -209,7 +206,6 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
             };
 
             if (is_v3 or is_v4) {
-                // V3/V4: metadata only (image data on disk). V4 also stores a content hash for duplicate suppression.
                 const fid = try reader.readIntLe(i64);
                 const raw_size = try reader.readIntLe(u32);
                 const content_hash = if (is_v4) try reader.readIntLe(u64) else hashStoredImage(allocator, fid, raw_size);
@@ -219,13 +215,12 @@ pub fn loadFromFile(self: *History, allocator: std.mem.Allocator, path: []const 
                     .sticky = sticky,
                 });
             } else {
-                // V1/V2: inline image data; migrate to disk.
                 const data_len = try reader.readIntLe(u32);
                 const raw_data = try reader.readBytes(data_len);
 
                 const file_id = img_store.nextFileId();
                 _ = img_store.save(allocator, raw_data, file_id) catch {
-                    continue; // skip image if compression/save fails
+                    continue;
                 };
                 try self.push(allocator, .{
                     .ts_unix = ts_unix,

@@ -31,11 +31,9 @@ pub fn nextFileId() i64 {
     return g_next_file_id;
 }
 
-/// Compress raw_data with LZNT1 and write to disk. Returns compressed size.
 pub fn save(allocator: std.mem.Allocator, raw_data: []const u8, file_id: i64) !u32 {
     const ws = g_workspace orelse return error.NoWorkspace;
 
-    // LZNT1 worst case: slight expansion possible
     const comp_buf_size: usize = raw_data.len + raw_data.len / 16 + 256;
     const comp_buf = try allocator.alloc(u8, comp_buf_size);
     defer allocator.free(comp_buf);
@@ -47,21 +45,19 @@ pub fn save(allocator: std.mem.Allocator, raw_data: []const u8, file_id: i64) !u
         @intCast(raw_data.len),
         comp_buf.ptr,
         @intCast(comp_buf_size),
-        4096, // chunk size for LZNT1
+        4096,
         &final_size,
         @ptrCast(ws.ptr),
     );
     if (status < 0) return error.CompressionFailed;
 
-    // Write to file
     var name_buf: [80]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "{d}.lz", .{file_id}) catch return error.NameTooLong;
 
     const cwd = std.Io.Dir.cwd();
     var dir = cwd.openDir(app_io.io, g_images_dir, .{}) catch |err| {
-        // Try creating the directory first
         cwd.createDirPath(app_io.io, g_images_dir) catch return err;
-        return save(allocator, raw_data, file_id); // retry once
+        return save(allocator, raw_data, file_id);
     };
     defer dir.close(app_io.io);
 
@@ -72,7 +68,6 @@ pub fn save(allocator: std.mem.Allocator, raw_data: []const u8, file_id: i64) !u
     return final_size;
 }
 
-/// Load and decompress image from disk. Caller must free returned slice.
 pub fn load(allocator: std.mem.Allocator, file_id: i64, raw_size: u32) ![]u8 {
     var name_buf: [80]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "{d}.lz", .{file_id}) catch return error.NameTooLong;
@@ -107,7 +102,6 @@ pub fn load(allocator: std.mem.Allocator, file_id: i64, raw_size: u32) ![]u8 {
     return result;
 }
 
-/// Delete image file from disk.
 pub fn delete(file_id: i64) void {
     var name_buf: [80]u8 = undefined;
     const name = std.fmt.bufPrint(&name_buf, "{d}.lz", .{file_id}) catch return;
