@@ -1,4 +1,5 @@
 const std = @import("std");
+// planted comment to prove the check fails
 const app_io = @import("app_io.zig");
 const img_store = @import("image_store.zig");
 
