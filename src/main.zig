@@ -10,12 +10,12 @@ const MESSAGE_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_msg");
 const PICKER_CLASS = std.unicode.utf8ToUtf16LeStringLiteral("lightboard_picker");
 const WINDOW_NAME = std.unicode.utf8ToUtf16LeStringLiteral("lightboard");
 const APP_VERSION = "v0.2.0";
-const HOTKEY_ID: usize = 1; // Ctrl+Alt+B fallback
-const HOTKEY_ID_F8: usize = 2; // F8 fallback
-const HOTKEY_ID_WINV: usize = 3; // Win+V primary
+const HOTKEY_ID: usize = 1;
+const HOTKEY_ID_F8: usize = 2;
+const HOTKEY_ID_WINV: usize = 3;
 const HOTKEY_POLL_TIMER_ID: usize = 10;
-const HOTKEY_POLL_INTERVAL_MS: w.UINT = 150; // only used if a RegisterHotKey call failed
-const HOTKEY_POLL_TOLERANCE_MS: w.DWORD = 100; // SetCoalescableTimer slack
+const HOTKEY_POLL_INTERVAL_MS: w.UINT = 150;
+const HOTKEY_POLL_TOLERANCE_MS: w.DWORD = 100;
 const TAB_Y: c_int = 8;
 const LIST_TOP: c_int = 32;
 const CARD_GAP: c_int = 4;
@@ -23,7 +23,7 @@ const CARD_LEFT: c_int = 12;
 const CARD_RIGHT_MARGIN: c_int = 20;
 const CARD_MIN_W: c_int = 80;
 const TEXT_LINE_H: c_int = 20;
-const TEXT_PAD_V: c_int = 20; // 10 top + 10 bottom
+const TEXT_PAD_V: c_int = 20;
 const TEXT_PAD_LEFT: c_int = 14;
 const TEXT_ACTION_GUTTER: c_int = 64;
 const TEXT_AVG_CHAR_W: c_int = 7;
@@ -32,7 +32,7 @@ const MAX_TEXT_LINES: usize = 5;
 const MIN_WRAP_CHARS: usize = 12;
 const MAX_WRAP_CHARS: usize = 80;
 const IMAGE_SIDE_PAD: c_int = 12;
-const IMAGE_PAD_V: c_int = 16; // 8 top + 8 bottom
+const IMAGE_PAD_V: c_int = 16;
 const IMAGE_MAX_THUMB_H: c_int = 104;
 const IMAGE_MIN_CARD_H: c_int = 48;
 const IMAGE_FALLBACK_CARD_H: c_int = 96;
@@ -53,8 +53,8 @@ var g_last_target_hwnd: w.HWND = null;
 var g_ui_font: w.HFONT = null;
 var g_history_path: []u8 = &[_]u8{};
 var g_images_dir_path: []u8 = &[_]u8{};
-var g_hotkey_debounce: i64 = 0; // timestamp of last toggle to prevent rapid re-toggle
-var g_win_event_hook: w.HWINEVENTHOOK = null; // event-driven foreground-window tracking
+var g_hotkey_debounce: i64 = 0;
+var g_win_event_hook: w.HWINEVENTHOOK = null;
 var g_winv_registered = false;
 var g_f8_needs_poll_fallback = false;
 var g_altb_needs_poll_fallback = false;
@@ -200,8 +200,6 @@ pub fn main(init: std.process.Init) !void {
 
     enableEcoQoS();
 
-    // Event-driven foreground-window tracking (WinEvent hook, not a keyboard
-    // hook — safe on this machine). Replaces the old 20ms polling timer.
     g_win_event_hook = w.SetWinEventHook(
         w.EVENT_SYSTEM_FOREGROUND,
         w.EVENT_SYSTEM_FOREGROUND,
@@ -218,10 +216,6 @@ pub fn main(init: std.process.Init) !void {
         dbgLog("SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed winerr={d}; falling back to remember-on-show only", .{w.GetLastError()});
     }
 
-    // Win+V is delivered via RegisterHotKey (MOD_WIN|MOD_NOREPEAT), not a
-    // low-level keyboard hook. WH_KEYBOARD_LL crashes this machine and must
-    // never be reintroduced. If Explorer still owns Win+V, this fails and we
-    // fall back to Ctrl+Alt+B / F8; see tools/free-win-v.ps1.
     g_winv_registered = registerWinVHotkey();
     defer if (g_winv_registered) {
         _ = w.UnregisterHotKey(g_message_hwnd, @intCast(HOTKEY_ID_WINV));
@@ -245,10 +239,6 @@ pub fn main(init: std.process.Init) !void {
         dbgLog("failed backup hotkey F8 winerr={d}", .{w.GetLastError()});
     }
 
-    // Poll-fallback timer: only runs if a RegisterHotKey call above failed.
-    // When all three succeed (the common case) there is no timer at all
-    // while the picker is hidden — zero idle wakeups. If it does run, it's
-    // coalesced and well above 100ms per the no-tight-polling rule.
     if (g_winv_needs_poll_fallback or g_altb_needs_poll_fallback or g_f8_needs_poll_fallback) {
         _ = w.SetCoalescableTimer(g_message_hwnd, HOTKEY_POLL_TIMER_ID, HOTKEY_POLL_INTERVAL_MS, null, HOTKEY_POLL_TOLERANCE_MS);
         g_poll_timer_running = true;
@@ -278,11 +268,9 @@ pub fn main(init: std.process.Init) !void {
     var loop_count: u64 = 0;
     while (w.GetMessageW(&msg, null, 0, 0) > 0) {
         loop_count += 1;
-        // Log first few iterations to confirm loop is running
         if (loop_count <= 3) {
             dbgLog("msg loop iter={d} msg=0x{X:0>4} hwnd={d}", .{ loop_count, msg.message, @intFromPtr(msg.hwnd) });
         }
-        // Always log WM_HOTKEY in the loop
         if (msg.message == w.WM_HOTKEY) {
             dbgLog("WM_HOTKEY in loop wparam={d} hwnd={d}", .{ msg.wParam, @intFromPtr(msg.hwnd) });
         }
@@ -298,9 +286,6 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-// WinEvent callback: fires only on real foreground-window changes (event
-// driven, no polling). Mirrors what the old 20ms `trackForegroundTarget`
-// poll did, minus the per-tick wakeup cost.
 fn foregroundEventProc(
     hook: w.HWINEVENTHOOK,
     event: w.DWORD,
@@ -371,8 +356,6 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
         },
         w.WM_TIMER => {
             if (wparam == HOTKEY_POLL_TIMER_ID) {
-                // Only reached at all when at least one RegisterHotKey call
-                // failed at startup; see main(). Coalesced, >=100ms.
                 pollHotkeyFallback();
                 return 0;
             }
@@ -409,7 +392,6 @@ fn wndProc(hwnd: w.HWND, msg: w.UINT, wparam: w.WPARAM, lparam: w.LPARAM) callco
             if (g_picker_hwnd != null and hwnd == g_picker_hwnd) {
                 const click_x = getXFromLParam(lparam);
                 const click_y = getYFromLParam(lparam);
-                // Tab bar click detection
                 if (click_y >= TAB_Y and click_y < LIST_TOP) {
                     if (click_x >= 16 and click_x < 80) {
                         switchActiveTab(.history);
@@ -531,11 +513,6 @@ fn togglePicker() void {
     dbgLog("picker shown by hotkey", .{});
 }
 
-// Idle = zero timers. There is currently nothing that needs a timer while
-// the picker is visible either (foreground tracking is event-driven via
-// SetWinEventHook, and outside-click hiding is WM_ACTIVATE/WM_KILLFOCUS
-// driven) — these are no-ops today but kept so a future visible-only need
-// has an obvious home instead of resurrecting an always-on timer.
 fn showPicker() void {
     if (g_picker_hwnd == null) return;
     rememberTargetWindow();
@@ -631,8 +608,6 @@ fn handlePickerKey(key: w.UINT) void {
 }
 
 fn handlePickerChar(ch: w.UINT) void {
-    // WM_CHAR is consumed here to prevent Windows beeping on unhandled chars.
-    // j/k navigation is handled in handlePickerKey via WM_KEYDOWN.
     _ = ch;
 }
 
@@ -675,7 +650,6 @@ fn pasteSelection() void {
     const target = resolvePasteTarget();
     if (target != null and target != g_picker_hwnd) {
         _ = w.SetForegroundWindow(target);
-        // Give Windows time to complete foreground handoff before synthetic keys.
         w.Sleep(140);
     } else {
         dbgLog("no previous target window available for focus restore", .{});
@@ -704,14 +678,12 @@ fn openSelectedImage() void {
 
     const allocator = gpa.allocator();
 
-    // Load raw image data from disk
     const raw_data = img_store.load(allocator, img.file_id, img.raw_size) catch |err| {
         dbgLog("failed to load image for preview: {s}", .{@errorName(err)});
         return;
     };
     defer allocator.free(raw_data);
 
-    // Write BMP file: 14-byte BITMAPFILEHEADER + DIB data
     const bmp_header_size: u32 = 14;
     const dib_header_size: u32 = if (raw_data.len >= 4)
         std.mem.readInt(u32, raw_data[0..4], .little)
@@ -728,7 +700,6 @@ fn openSelectedImage() void {
     std.mem.writeInt(u16, header[8..10], 0, .little);
     std.mem.writeInt(u32, header[10..14], pixel_offset, .little);
 
-    // Write to %LOCALAPPDATA%\lightboard\preview.bmp
     const env: std.process.Environ = .{ .block = .global };
     const local_app_data = env.getAlloc(allocator, "LOCALAPPDATA") catch {
         dbgLog("LOCALAPPDATA not found, can't open image", .{});
@@ -750,7 +721,6 @@ fn openSelectedImage() void {
 
     dbgLog("wrote preview.bmp, opening with shell", .{});
 
-    // Convert path to wide string for ShellExecuteW
     var wide_path: [std.fs.max_path_bytes]u16 = undefined;
     var i: usize = 0;
     for (bmp_path) |c| {
@@ -810,7 +780,6 @@ fn toggleSticky() void {
     g_history.entries.items[r.real_idx].sticky = !g_history.entries.items[r.real_idx].sticky;
     dbgLog("toggled sticky idx={d} now={}", .{ r.real_idx, g_history.entries.items[r.real_idx].sticky });
 
-    // Entry moved to the other tab — clamp the active tab without losing the other tab's scroll state.
     clampActiveView();
     _ = w.InvalidateRect(g_picker_hwnd, null, 1);
     persistHistory();
@@ -870,12 +839,10 @@ fn paintPicker(hwnd: w.HWND) void {
     _ = w.SetBkMode(hdc, w.TRANSPARENT);
     _ = w.SetTextColor(hdc, color_text_main);
 
-    // Draw tab bar
     _ = w.SetTextColor(hdc, if (g_active_tab == .history) color_accent else color_text_sub);
     drawUtf8Line(hdc, 16, TAB_Y, "History");
     _ = w.SetTextColor(hdc, if (g_active_tab == .pinned) color_accent else color_text_sub);
     drawUtf8Line(hdc, 90, TAB_Y, "Pinned");
-    // Active tab underline
     {
         const ux: c_int = if (g_active_tab == .history) 16 else 90;
         const uw: c_int = if (g_active_tab == .history) 54 else 48;
@@ -966,8 +933,6 @@ fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_ma
     const text_y = rect.top + 10;
     const color_icon_dim = w.RGB(100, 100, 100);
 
-    // Draw pin icon (always visible, top-right area)
-    // U+25CF BLACK CIRCLE when sticky, U+25CB WHITE CIRCLE when not
     if (entry.sticky) {
         _ = w.SetTextColor(hdc, color_accent);
         drawUtf8Line(hdc, rect.right - 42, rect.top + 4, "\xE2\x97\x8F");
@@ -976,7 +941,6 @@ fn renderEntryLine(hdc: w.HDC, rect: w.RECT, entry: history.Entry, color_text_ma
         drawUtf8Line(hdc, rect.right - 42, rect.top + 4, "\xE2\x97\x8B");
     }
 
-    // Draw delete icon × (U+00D7) — always visible
     _ = w.SetTextColor(hdc, color_text_sub);
     drawUtf8Line(hdc, rect.right - 20, rect.top + 4, "\xC3\x97");
 
@@ -1224,10 +1188,6 @@ fn rememberTargetWindow() void {
     }
 }
 
-// Only reached via HOTKEY_POLL_TIMER_ID, which only exists when at least one
-// RegisterHotKey call failed at startup (see main()). Each branch is gated
-// on its own *_needs_poll_fallback flag so a hotkey that registered
-// successfully is never redundantly polled — WM_HOTKEY already covers it.
 fn pollHotkeyFallback() void {
     const now = app_io.milliTimestamp();
     if (now - g_hotkey_debounce < 300) return;
@@ -1337,11 +1297,9 @@ fn hitTestClick(click_x: i32, click_y: i32) ?HitResult {
         const card_h = entryCardHeight(r.entry, card_w);
         if (list_y >= item_top and list_y < item_top + card_h) {
             const local_y = list_y - item_top;
-            // Check delete icon area (right side)
             if (click_x >= card_right - 28 and click_x <= card_right - 4 and local_y < 24) {
                 return .{ .from_newest = i, .zone = .delete };
             }
-            // Check pin icon area (left of delete)
             if (click_x >= card_right - 52 and click_x < card_right - 28 and local_y < 24) {
                 return .{ .from_newest = i, .zone = .pin };
             }
@@ -1543,11 +1501,6 @@ fn getWheelDelta(wparam: w.WPARAM) i16 {
     return @bitCast(hi);
 }
 
-// EcoQoS: ask the scheduler to run this process on efficiency cores / at
-// lower clocks when it's not the thing the user is actively interacting
-// with. Cheap to leave on all the time for a background hotkey utility with
-// no latency-critical hot path; if picker responsiveness ever suffers, this
-// is the first thing to make visible-only.
 fn enableEcoQoS() void {
     var state = w.PROCESS_POWER_THROTTLING_STATE{
         .Version = w.PROCESS_POWER_THROTTLING_CURRENT_VERSION,
@@ -1617,7 +1570,6 @@ fn initPersistence(allocator: std.mem.Allocator) !void {
     g_history_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, "history.bin" });
     dbgLog("persistence path: {s}", .{g_history_path});
 
-    // Set up images directory and compression workspace
     const images_dir = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, "images" });
     try std.Io.Dir.cwd().createDirPath(app_io.io, images_dir);
     g_images_dir_path = images_dir;

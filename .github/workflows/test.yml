@@ -16,5 +16,10 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: No code comments
+        run: node tools/strip-comments.mjs --check
       - name: Run unit tests
         run: zig build test
